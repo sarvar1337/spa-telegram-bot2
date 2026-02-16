@@ -14,7 +14,7 @@ from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from zoneinfo import ZoneInfo
 from dotenv import load_dotenv
 
-# mini web server for Render (open port)
+# Mini web server for Render (open port)
 from aiohttp import web
 
 load_dotenv()
@@ -34,6 +34,7 @@ def is_admin(msg: Message) -> bool:
     return bool(msg.from_user and msg.from_user.id == ADMIN_ID)
 
 def parse_hhmm(s: str) -> dtime:
+    s = s.strip()
     if not re.match(r"^\d{1,2}:\d{2}$", s):
         raise ValueError("Bad HH:MM format")
     hh, mm = map(int, s.split(":"))
@@ -42,9 +43,10 @@ def parse_hhmm(s: str) -> dtime:
     return dtime(hour=hh, minute=mm)
 
 def parse_ddmm(s: str):
-    if not re.match(r"^\d{1,2}\.\d{1,2}$", s.strip()):
+    s = s.strip()
+    if not re.match(r"^\d{1,2}\.\d{1,2}$", s):
         raise ValueError("Bad DD.MM format")
-    d, m = map(int, s.strip().split("."))
+    d, m = map(int, s.split("."))
     if not (1 <= d <= 31 and 1 <= m <= 12):
         raise ValueError("Bad DD.MM value")
     return d, m
@@ -55,10 +57,15 @@ def make_dt(ddmm: str, hhmm: str) -> datetime:
     now = datetime.now(TZ)
     year = now.year
     dt = datetime(year, month, day, tm.hour, tm.minute, tzinfo=TZ)
-    # если дата уже прошла — считаем следующий год
+    # If date already passed - use next year
     if dt < now - timedelta(days=1):
         dt = dt.replace(year=year + 1)
     return dt
+
+def day_range(day: datetime):
+    start = datetime(day.year, day.month, day.day, 0, 0, tzinfo=TZ)
+    end = start + timedelta(days=1)
+    return start, end
 
 
 # ---------- DB ----------
@@ -102,14 +109,8 @@ async def set_setting(key: str, value: str):
         )
         await db.commit()
 
-async def booking_exists(dt: datetime) -> bool:
-    async with aiosqlite.connect(DB_PATH) as db:
-        async with db.execute("SELECT 1 FROM bookings WHERE ts=? LIMIT 1", (dt.isoformat(),)) as cur:
-            row = await cur.fetchone()
-            return row is not None
-
 async def add_booking(dt: datetime, info: str):
-    # возвращает (ok, id_or_error)
+    # returns (ok, id_or_error)
     try:
         async with aiosqlite.connect(DB_PATH) as db:
             cur = await db.execute(
@@ -126,11 +127,6 @@ async def delete_booking(bid: int) -> bool:
         cur = await db.execute("DELETE FROM bookings WHERE id=?", (bid,))
         await db.commit()
         return cur.rowcount > 0
-
-def day_range(day: datetime):
-    start = datetime(day.year, day.month, day.day, 0, 0, tzinfo=TZ)
-    end = start + timedelta(days=1)
-    return start, end
 
 async def list_bookings_between(start: datetime, end: datetime):
     async with aiosqlite.connect(DB_PATH) as db:
@@ -234,6 +230,7 @@ async def run_bot():
     scheduler = AsyncIOScheduler(timezone=TZ)
 
     def schedule_morning_job(morning_hhmm: str):
+        # remove old job if exists
         try:
             scheduler.remove_job("morning_summary")
         except Exception:
@@ -249,8 +246,10 @@ async def run_bot():
             replace_existing=True
         )
 
+    # periodic reminders
     scheduler.add_job(send_one_hour_reminders, "interval", minutes=1, args=[bot])
 
+    # morning summary time from DB (or default)
     morning_time = (await get_setting("morning_time")) or MORNING_TIME_DEFAULT
     try:
         parse_hhmm(morning_time)
@@ -269,13 +268,14 @@ async def run_bot():
         await state.clear()
         await m.answer(
             "✅ Бот бронирования.\n\n"
-            "Можно работать через кнопки 👇\n"
-            "Или команды:\n"
+            "Работа через кнопки 👇\n\n"
+            "Команды (если нужно):\n"
             "/add ДД.ММ ЧЧ:ММ текст\n"
             "/today\n"
             "/list ДД.ММ\n"
             "/del ID\n"
-            "/time HH:MM\n",
+            "/time HH:MM\n\n"
+            "🚫 Запрет пересечения: нельзя ставить 2 брони на одно и то же время.",
             reply_markup=main_kb()
         )
 
@@ -303,20 +303,23 @@ async def run_bot():
         if len(parts) != 2:
             await m.answer("Формат: /list 20.02", reply_markup=main_kb())
             return
+
         ddmm = parts[1].strip()
         try:
-            # берём только дату, время 00:00
             d, mo = parse_ddmm(ddmm)
             now = datetime.now(TZ)
             target = datetime(now.year, mo, d, 0, 0, tzinfo=TZ)
         except Exception:
             await m.answer("Неверная дата. Пример: /list 20.02", reply_markup=main_kb())
             return
+
         start, end = day_range(target)
         rows = await list_bookings_between(start, end)
+
         if not rows:
             await m.answer(f"На {ddmm} броней нет ✅", reply_markup=main_kb())
             return
+
         lines = [f"📅 Брони на {ddmm}:"]
         for bid, ts, txt in rows:
             dt = datetime.fromisoformat(ts)
@@ -349,14 +352,13 @@ async def run_bot():
             await m.answer("Неверное время. Пример: /time 09:00", reply_markup=main_kb())
             return
         await set_setting("morning_time", mt)
-        schedule_morning_job(mt)  # применяем сразу
+        schedule_morning_job(mt)  # apply immediately
         await m.answer(f"✅ Утренний отчёт теперь в {mt}", reply_markup=main_kb())
 
     @dp.message(Command("add"))
     async def cmd_add(m: Message):
         if not is_admin(m):
             return
-        # /add DD.MM HH:MM text
         mm = re.match(r"^/add\s+(\d{1,2}\.\d{1,2})\s+(\d{1,2}:\d{2})\s+(.+)$", (m.text or "").strip())
         if not mm:
             await m.answer("Формат: /add 20.02 14:00 Текст", reply_markup=main_kb())
@@ -374,24 +376,24 @@ async def run_bot():
             return
         await m.answer(f"✅ Добавлено: #{res} — {dt.strftime('%d.%m %H:%M')} — {text}", reply_markup=main_kb())
 
-    # ---- Buttons (text) ----
+    # ---- Buttons ----
     @dp.message(F.text == "ℹ️ Помощь")
     async def help_btn(m: Message):
         if not is_admin(m):
             return
         await m.answer(
+            "Кнопки:\n"
+            "➕ Добавить бронь — пошаговое добавление\n"
+            "📅 Сегодня — список броней\n"
+            "📆 На дату — список на дату\n"
+            "🗑 Удалить — удалить по ID\n\n"
             "Команды:\n"
             "/add ДД.ММ ЧЧ:ММ текст\n"
             "/today\n"
             "/list ДД.ММ\n"
             "/del ID\n"
             "/time HH:MM\n\n"
-            "Через кнопки:\n"
-            "➕ Добавить бронь — пошаговое добавление\n"
-            "📅 Сегодня — список\n"
-            "📆 На дату — попросит дату\n"
-            "🗑 Удалить — попросит ID\n\n"
-            "🚫 Запрет пересечения: нельзя ставить две брони на одно и то же время.",
+            "🚫 Запрет пересечения: нельзя ставить 2 брони на одно и то же время.",
             reply_markup=main_kb()
         )
 
@@ -405,16 +407,16 @@ async def run_bot():
             return
         await state.clear()
         await state.set_state(AddFlow.waiting_date)
-        await m.answer("Введите дату в формате ДД.ММ (например 20.02) или нажмите ❌ Отмена", reply_markup=cancel_kb())
+        await m.answer("Введите дату ДД.ММ (например 20.02) или нажмите ❌ Отмена", reply_markup=cancel_kb())
 
     @dp.message(F.text == "📆 На дату")
     async def list_date_btn(m: Message, state: FSMContext):
         if not is_admin(m):
             return
         await state.clear()
-        await state.set_state(AddFlow.waiting_date)
         await state.update_data(mode="list_only")
-        await m.answer("Введите дату в формате ДД.ММ (например 20.02) или нажмите ❌ Отмена", reply_markup=cancel_kb())
+        await state.set_state(AddFlow.waiting_date)
+        await m.answer("Введите дату ДД.ММ (например 20.02) или нажмите ❌ Отмена", reply_markup=cancel_kb())
 
     @dp.message(F.text == "🗑 Удалить")
     async def del_btn(m: Message, state: FSMContext):
@@ -422,7 +424,7 @@ async def run_bot():
             return
         await state.clear()
         await state.update_data(mode="delete")
-        await m.answer("Введите ID брони для удаления (пример: 12) или нажмите ❌ Отмена", reply_markup=cancel_kb())
+        await m.answer("Введите ID брони для удаления (пример: 12) или ❌ Отмена", reply_markup=cancel_kb())
 
     @dp.message(F.text == "❌ Отмена")
     async def cancel_any(m: Message, state: FSMContext):
@@ -438,9 +440,10 @@ async def run_bot():
             return
         txt = (m.text or "").strip()
         data = await state.get_data()
+        mode = data.get("mode")
 
-        if data.get("mode") == "delete":
-            # сюда не должно попасть, но на всякий:
+        # If delete mode - should not be here
+        if mode == "delete":
             await state.clear()
             await m.answer("Ошибка режима. Нажмите 🗑 Удалить ещё раз.", reply_markup=main_kb())
             return
@@ -451,17 +454,30 @@ async def run_bot():
             await m.answer("Неверная дата. Пример: 20.02")
             return
 
-        if data.get("mode") == "list_only":
-            # показать список на дату
+        # FIXED: list-only mode WITHOUT creating fake Message
+        if mode == "list_only":
             await state.clear()
-            # используем /list логику
-            m2 = Message.model_validate({**m.model_dump(), "text": f"/list {txt}"})
-            await cmd_list(m2)
+            d, mo = parse_ddmm(txt)
+            now = datetime.now(TZ)
+            target = datetime(now.year, mo, d, 0, 0, tzinfo=TZ)
+            start, end = day_range(target)
+            rows = await list_bookings_between(start, end)
+
+            if not rows:
+                await m.answer(f"На {txt} броней нет ✅", reply_markup=main_kb())
+                return
+
+            lines = [f"📅 Брони на {txt}:"]
+            for bid, ts, t2 in rows:
+                dt = datetime.fromisoformat(ts)
+                lines.append(f"#{bid} — {dt.strftime('%H:%M')} — {t2}")
+            await m.answer("\n".join(lines), reply_markup=main_kb())
             return
 
+        # add flow
         await state.update_data(ddmm=txt)
         await state.set_state(AddFlow.waiting_time)
-        await m.answer("Введите время в формате ЧЧ:ММ (например 14:00) или ❌ Отмена", reply_markup=cancel_kb())
+        await m.answer("Введите время ЧЧ:ММ (например 14:00) или ❌ Отмена", reply_markup=cancel_kb())
 
     @dp.message(AddFlow.waiting_time)
     async def fsm_time(m: Message, state: FSMContext):
@@ -501,12 +517,15 @@ async def run_bot():
         await state.clear()
 
         if not ok and res == "busy":
-            await m.answer(f"⚠️ На {dt.strftime('%d.%m')} в {dt.strftime('%H:%M')} уже есть бронь.\nВыберите другое время.", reply_markup=main_kb())
+            await m.answer(
+                f"⚠️ На {dt.strftime('%d.%m')} в {dt.strftime('%H:%M')} уже есть бронь.\nВыберите другое время.",
+                reply_markup=main_kb()
+            )
             return
 
         await m.answer(f"✅ Добавлено: #{res} — {dt.strftime('%d.%m %H:%M')} — {text}", reply_markup=main_kb())
 
-    # delete mode handler (simple)
+    # delete mode handler (catch-all)
     @dp.message()
     async def fallback(m: Message, state: FSMContext):
         if not is_admin(m):
@@ -522,7 +541,6 @@ async def run_bot():
             await m.answer("🗑 Удалено" if ok else "Не найдено", reply_markup=main_kb())
             return
 
-        # если просто написал что-то — покажем подсказку
         await m.answer("Нажмите кнопку или /start для меню.", reply_markup=main_kb())
 
     await dp.start_polling(bot)
