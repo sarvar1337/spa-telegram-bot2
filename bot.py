@@ -20,7 +20,6 @@ from aiogram.fsm.storage.memory import MemoryStorage
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from zoneinfo import ZoneInfo
 from dotenv import load_dotenv
-
 from aiohttp import web
 
 load_dotenv()
@@ -34,24 +33,37 @@ PORT = int(os.getenv("PORT", "10000"))
 TZ = ZoneInfo(TZ_NAME)
 DB_PATH = "bookings.db"
 
-SPA_PHONE = "+998916768900"  # номер вашего SPA
-
+SPA_PHONE = "+998916768900"
 OPEN_TIME = dtime(9, 0)
 CLOSE_TIME = dtime(22, 0)
 
 ANTISPAM_MINUTES = 10
 MY_REQUESTS_LIMIT = 10
 
-SERVICES = {
-    "🏊 Бассейн": "Бассейн",
-    "🔥 Сауна": "Сауна",
-    "💆 Массаж": "Массаж",
+SERVICE_BTNS = [
+    "🧖‍♂️ Турецкий SPA",
+    "🏊 Бассейн (отдельный)",
+    "🏊‍♂️🔥 Бассейн + Сауна",
+    "💆 Массаж",
+    "🏋️ Тренажёрный зал",
+]
+SERVICE_MAP_RU = {s: s for s in SERVICE_BTNS}
+SERVICE_MAP_UZ = {
+    "🧖‍♂️ Турецкий SPA": "🧖‍♂️ Turkcha SPA",
+    "🏊 Бассейн (отдельный)": "🏊 Alohida basseyn",
+    "🏊‍♂️🔥 Бассейн + Сауна": "🏊‍♂️🔥 Basseyn + Sauna",
+    "💆 Массаж": "💆 Massaj",
+    "🏋️ Тренажёрный зал": "🏋️ Trenajor zali",
 }
 
 
-# ---------- Helpers ----------
+def t(lang: str, ru: str, uz: str) -> str:
+    return uz if lang == "uz" else ru
+
+
 def is_admin(msg: Message) -> bool:
     return bool(msg.from_user and msg.from_user.id == ADMIN_ID)
+
 
 def parse_hhmm(s: str) -> dtime:
     s = s.strip()
@@ -62,6 +74,7 @@ def parse_hhmm(s: str) -> dtime:
         raise ValueError("Bad HH:MM value")
     return dtime(hour=hh, minute=mm)
 
+
 def parse_ddmm(s: str):
     s = s.strip()
     if not re.fullmatch(r"\d{1,2}\.\d{1,2}", s):
@@ -71,19 +84,14 @@ def parse_ddmm(s: str):
         raise ValueError("Bad DD.MM value")
     return d, m
 
+
 def day_range(day: datetime):
     start = datetime(day.year, day.month, day.day, 0, 0, tzinfo=TZ)
     end = start + timedelta(days=1)
     return start, end
 
+
 def normalize_uz_phone(raw: str) -> str | None:
-    """
-    Accept:
-      +998XXXXXXXXX
-      998XXXXXXXXX
-      XXXXXXXXX (9 digits)
-    Return normalized: +998XXXXXXXXX
-    """
     s = (raw or "").strip().replace(" ", "").replace("-", "")
     if re.fullmatch(r"\+998\d{9}", s):
         return s
@@ -93,73 +101,121 @@ def normalize_uz_phone(raw: str) -> str | None:
         return "+998" + s
     return None
 
+
 def spa_phone_examples() -> tuple[str, str, str]:
-    # from +998916768900 -> country 998 + last 9 digits
     digits = re.sub(r"\D", "", SPA_PHONE)
     if digits.startswith("998") and len(digits) == 12:
         local9 = digits[3:]
-    elif len(digits) >= 9:
-        local9 = digits[-9:]
-        digits = "998" + local9
     else:
-        local9 = "916768900"
+        local9 = digits[-9:] if len(digits) >= 9 else "916768900"
         digits = "998" + local9
     return (f"+{digits}", digits, local9)
 
+
 EX_PLUS, EX_998, EX_9 = spa_phone_examples()
+
 
 def make_dt_current_year(ddmm: str, hhmm: str) -> datetime:
     d, mo = parse_ddmm(ddmm)
-    t = parse_hhmm(hhmm)
+    tm = parse_hhmm(hhmm)
     now = datetime.now(TZ)
-    return datetime(now.year, mo, d, t.hour, t.minute, tzinfo=TZ)
-
-def in_working_hours(t: dtime) -> bool:
-    # 09:00..22:00 inclusive
-    return OPEN_TIME <= t <= CLOSE_TIME
+    return datetime(now.year, mo, d, tm.hour, tm.minute, tzinfo=TZ)
 
 
-# ---------- DB ----------
+def in_working_hours(tm: dtime) -> bool:
+    return OPEN_TIME <= tm <= CLOSE_TIME
+
+
+def fmt_dt(dt: datetime) -> str:
+    return dt.strftime("%d.%m %H:%M")
+
+
+async def table_columns(db: aiosqlite.Connection, table: str) -> set[str]:
+    cols = set()
+    async with db.execute(f"PRAGMA table_info({table})") as cur:
+        rows = await cur.fetchall()
+    for r in rows:
+        cols.add(r[1])
+    return cols
+
+
+async def add_column_if_missing(db: aiosqlite.Connection, table: str, col: str, ddl_type: str, default_sql: str | None = None):
+    cols = await table_columns(db, table)
+    if col in cols:
+        return
+    if default_sql is None:
+        await db.execute(f"ALTER TABLE {table} ADD COLUMN {col} {ddl_type}")
+    else:
+        await db.execute(f"ALTER TABLE {table} ADD COLUMN {col} {ddl_type} DEFAULT {default_sql}")
+
+
 async def init_db():
     async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("""
+        CREATE TABLE IF NOT EXISTS users (
+            user_id INTEGER PRIMARY KEY,
+            lang TEXT NOT NULL
+        )""")
+
         await db.execute("""
         CREATE TABLE IF NOT EXISTS bookings (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             ts TEXT NOT NULL,
             text TEXT NOT NULL,
-            reminded INTEGER DEFAULT 0,
+            reminded_admin INTEGER DEFAULT 0,
+            reminded_client INTEGER DEFAULT 0,
+            client_chat_id INTEGER,
+            client_user_id INTEGER,
+            client_lang TEXT,
             created_at TEXT NOT NULL
-        )
-        """)
+        )""")
+
         await db.execute("""
         CREATE TABLE IF NOT EXISTS requests (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             ts TEXT NOT NULL,
-            text TEXT NOT NULL,
+            service TEXT NOT NULL,
+            name TEXT NOT NULL,
+            phone TEXT NOT NULL,
             client_id INTEGER NOT NULL,
             chat_id INTEGER NOT NULL,
-            status TEXT NOT NULL,           -- pending/confirmed/declined
+            lang TEXT NOT NULL,
+            status TEXT NOT NULL,
             booking_id INTEGER,
+            decline_comment TEXT,
             created_at TEXT NOT NULL
-        )
-        """)
+        )""")
+
+        await add_column_if_missing(db, "bookings", "reminded_admin", "INTEGER", "0")
+        await add_column_if_missing(db, "bookings", "reminded_client", "INTEGER", "0")
+        await add_column_if_missing(db, "bookings", "client_chat_id", "INTEGER")
+        await add_column_if_missing(db, "bookings", "client_user_id", "INTEGER")
+        await add_column_if_missing(db, "bookings", "client_lang", "TEXT")
+
+        await add_column_if_missing(db, "requests", "service", "TEXT", "'-'")
+        await add_column_if_missing(db, "requests", "name", "TEXT", "'-'")
+        await add_column_if_missing(db, "requests", "phone", "TEXT", "'-'")
+        await add_column_if_missing(db, "requests", "lang", "TEXT", "'ru'")
+        await add_column_if_missing(db, "requests", "decline_comment", "TEXT")
+
         await db.execute("""
         CREATE TABLE IF NOT EXISTS settings (
             key TEXT PRIMARY KEY,
             value TEXT NOT NULL
-        )
-        """)
+        )""")
         await db.execute(
             "INSERT OR IGNORE INTO settings(key,value) VALUES('morning_time', ?)",
             (MORNING_TIME_DEFAULT,)
         )
         await db.commit()
 
+
 async def get_setting(key: str) -> str:
     async with aiosqlite.connect(DB_PATH) as db:
         async with db.execute("SELECT value FROM settings WHERE key=?", (key,)) as cur:
             row = await cur.fetchone()
             return row[0] if row else ""
+
 
 async def set_setting(key: str, value: str):
     async with aiosqlite.connect(DB_PATH) as db:
@@ -170,20 +226,41 @@ async def set_setting(key: str, value: str):
         )
         await db.commit()
 
-async def add_booking(dt: datetime, info: str) -> int:
+
+async def get_user_lang(user_id: int) -> str | None:
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute("SELECT lang FROM users WHERE user_id=?", (user_id,)) as cur:
+            row = await cur.fetchone()
+            return row[0] if row else None
+
+
+async def set_user_lang(user_id: int, lang: str):
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            "INSERT INTO users(user_id, lang) VALUES(?,?) "
+            "ON CONFLICT(user_id) DO UPDATE SET lang=excluded.lang",
+            (user_id, lang)
+        )
+        await db.commit()
+
+
+async def add_booking(dt: datetime, info: str, client_chat_id: int | None, client_user_id: int | None, client_lang: str | None) -> int:
     async with aiosqlite.connect(DB_PATH) as db:
         cur = await db.execute(
-            "INSERT INTO bookings(ts, text, reminded, created_at) VALUES(?,?,0,?)",
-            (dt.isoformat(), info, datetime.now(TZ).isoformat())
+            "INSERT INTO bookings(ts, text, reminded_admin, reminded_client, client_chat_id, client_user_id, client_lang, created_at) "
+            "VALUES(?, ?, 0, 0, ?, ?, ?, ?)",
+            (dt.isoformat(), info, client_chat_id, client_user_id, client_lang, datetime.now(TZ).isoformat())
         )
         await db.commit()
         return cur.lastrowid
+
 
 async def delete_booking(bid: int) -> bool:
     async with aiosqlite.connect(DB_PATH) as db:
         cur = await db.execute("DELETE FROM bookings WHERE id=?", (bid,))
         await db.commit()
         return cur.rowcount > 0
+
 
 async def list_bookings_between(start: datetime, end: datetime):
     async with aiosqlite.connect(DB_PATH) as db:
@@ -193,68 +270,78 @@ async def list_bookings_between(start: datetime, end: datetime):
         ) as cur:
             return await cur.fetchall()
 
-async def create_request(dt: datetime, text: str, client_id: int, chat_id: int) -> int:
+
+async def create_request(dt: datetime, service: str, name: str, phone: str, client_id: int, chat_id: int, lang: str) -> int:
     async with aiosqlite.connect(DB_PATH) as db:
         cur = await db.execute(
-            "INSERT INTO requests(ts, text, client_id, chat_id, status, created_at) VALUES(?,?,?,?, 'pending', ?)",
-            (dt.isoformat(), text, client_id, chat_id, datetime.now(TZ).isoformat())
+            "INSERT INTO requests(ts, service, name, phone, client_id, chat_id, lang, status, created_at) "
+            "VALUES(?,?,?,?,?,?,?, 'pending', ?)",
+            (dt.isoformat(), service, name, phone, client_id, chat_id, lang, datetime.now(TZ).isoformat())
         )
         await db.commit()
         return cur.lastrowid
 
+
 async def get_request(req_id: int):
     async with aiosqlite.connect(DB_PATH) as db:
         async with db.execute(
-            "SELECT id, ts, text, client_id, chat_id, status, booking_id, created_at FROM requests WHERE id=?",
+            "SELECT id, ts, service, name, phone, client_id, chat_id, lang, status, booking_id, decline_comment, created_at "
+            "FROM requests WHERE id=?",
             (req_id,)
         ) as cur:
             return await cur.fetchone()
 
-async def set_request_status(req_id: int, status: str, booking_id: int | None = None):
+
+async def set_request_status(req_id: int, status: str, booking_id: int | None = None, decline_comment: str | None = None):
     async with aiosqlite.connect(DB_PATH) as db:
         await db.execute(
-            "UPDATE requests SET status=?, booking_id=? WHERE id=?",
-            (status, booking_id, req_id)
+            "UPDATE requests SET status=?, booking_id=?, decline_comment=? WHERE id=?",
+            (status, booking_id, decline_comment, req_id)
         )
         await db.commit()
+
 
 async def list_pending_requests(limit: int = 50):
     async with aiosqlite.connect(DB_PATH) as db:
         async with db.execute(
-            "SELECT id, ts, text, client_id, created_at FROM requests WHERE status='pending' ORDER BY created_at ASC LIMIT ?",
+            "SELECT id, ts, service, name, phone, client_id, lang, created_at "
+            "FROM requests WHERE status='pending' ORDER BY created_at ASC LIMIT ?",
             (limit,)
         ) as cur:
             return await cur.fetchall()
 
+
 async def list_requests_for_client(client_id: int, limit: int = 10):
     async with aiosqlite.connect(DB_PATH) as db:
         async with db.execute(
-            "SELECT id, ts, text, status, booking_id, created_at FROM requests WHERE client_id=? ORDER BY created_at DESC LIMIT ?",
+            "SELECT id, ts, service, status, booking_id, created_at "
+            "FROM requests WHERE client_id=? ORDER BY created_at DESC LIMIT ?",
             (client_id, limit)
         ) as cur:
             return await cur.fetchall()
 
-async def has_recent_request(client_id: int, minutes: int) -> int:
-    """Return seconds left if still in cooldown else 0."""
-    now = datetime.now(TZ)
-    border = now - timedelta(minutes=minutes)
+
+async def latest_request_time(client_id: int) -> datetime | None:
     async with aiosqlite.connect(DB_PATH) as db:
         async with db.execute(
             "SELECT created_at FROM requests WHERE client_id=? ORDER BY created_at DESC LIMIT 1",
             (client_id,)
         ) as cur:
             row = await cur.fetchone()
+    return datetime.fromisoformat(row[0]) if row else None
 
-    if not row:
+
+async def antispam_seconds_left(client_id: int, minutes: int) -> int:
+    last = await latest_request_time(client_id)
+    if not last:
         return 0
-    last = datetime.fromisoformat(row[0])
-    if last >= border:
-        left = int((last + timedelta(minutes=minutes) - now).total_seconds())
-        return max(left, 1)
+    now = datetime.now(TZ)
+    until = last + timedelta(minutes=minutes)
+    if until > now:
+        return max(1, int((until - now).total_seconds()))
     return 0
 
 
-# ---------- Notifications (ONLY bookings table) ----------
 async def send_today_summary(bot: Bot):
     today = datetime.now(TZ)
     start, end = day_range(today)
@@ -268,6 +355,7 @@ async def send_today_summary(bot: Bot):
         lines.append(f"#{bid} — {dt.strftime('%H:%M')} — {txt}")
     await bot.send_message(ADMIN_ID, "\n".join(lines))
 
+
 async def send_one_hour_reminders(bot: Bot):
     now = datetime.now(TZ)
     window_start = now + timedelta(minutes=59)
@@ -275,29 +363,43 @@ async def send_one_hour_reminders(bot: Bot):
 
     async with aiosqlite.connect(DB_PATH) as db:
         async with db.execute("""
-            SELECT id, ts, text FROM bookings
-            WHERE reminded=0 AND ts >= ? AND ts < ?
+            SELECT id, ts, text, client_chat_id, client_lang, reminded_admin, reminded_client
+            FROM bookings
+            WHERE ts >= ? AND ts < ?
             ORDER BY ts ASC
         """, (window_start.isoformat(), window_end.isoformat())) as cur:
             rows = await cur.fetchall()
 
-        for bid, ts, txt in rows:
+        for bid, ts, txt, client_chat_id, client_lang, ra, rc in rows:
             dt = datetime.fromisoformat(ts)
-            await bot.send_message(
-                ADMIN_ID,
-                f"⏰ Через 1 час: {dt.strftime('%d.%m %H:%M')} — {txt} (#{bid})"
-            )
-            await db.execute("UPDATE bookings SET reminded=1 WHERE id=?", (bid,))
+
+            if ra == 0:
+                await bot.send_message(ADMIN_ID, f"⏰ Через 1 час: {fmt_dt(dt)} — {txt} (#{bid})")
+                await db.execute("UPDATE bookings SET reminded_admin=1 WHERE id=?", (bid,))
+
+            if client_chat_id and rc == 0:
+                lang = client_lang or "ru"
+                msg = t(
+                    lang,
+                    f"⏰ Напоминание: через 1 час у вас бронь {fmt_dt(dt)}.\n☎️ SPA: {SPA_PHONE}",
+                    f"⏰ Eslatma: 1 soatdan keyin bandingiz bor {fmt_dt(dt)}.\n☎️ SPA: {SPA_PHONE}"
+                )
+                try:
+                    await bot.send_message(int(client_chat_id), msg)
+                    await db.execute("UPDATE bookings SET reminded_client=1 WHERE id=?", (bid,))
+                except Exception:
+                    pass
 
         await db.commit()
 
 
-# ---------- Render web server ----------
 async def handle_root(_request):
     return web.Response(text="OK")
 
+
 async def handle_healthz(_request):
     return web.Response(text="OK")
+
 
 async def run_web_server():
     app = web.Application()
@@ -309,41 +411,49 @@ async def run_web_server():
     await site.start()
 
 
-# ---------- Keyboards ----------
+def kb_lang():
+    return ReplyKeyboardMarkup(
+        keyboard=[[KeyboardButton(text="🇷🇺 Русский"), KeyboardButton(text="🇺🇿 Oʻzbek")]],
+        resize_keyboard=True
+    )
+
+
 def admin_kb():
     return ReplyKeyboardMarkup(
         keyboard=[
             [KeyboardButton(text="🕓 Ожидающие заявки"), KeyboardButton(text="📅 Сегодня")],
-            [KeyboardButton(text="➕ Добавить бронь"), KeyboardButton(text="📆 На дату")],
-            [KeyboardButton(text="🗑 Удалить"), KeyboardButton(text="ℹ️ Помощь")],
+            [KeyboardButton(text="ℹ️ Помощь")],
         ],
         resize_keyboard=True
     )
 
-def client_kb():
+
+def client_kb(lang: str):
     return ReplyKeyboardMarkup(
         keyboard=[
-            [KeyboardButton(text="📅 Записаться"), KeyboardButton(text="🧾 Мои заявки")],
-            [KeyboardButton(text="☎️ Связаться с админом")],
+            [KeyboardButton(text=t(lang, "📅 Записаться", "📅 Yozilish")),
+             KeyboardButton(text=t(lang, "🧾 Мои заявки", "🧾 Mening arizalarim"))],
+            [KeyboardButton(text=t(lang, "☎️ Связаться с админом", "☎️ Administrator bilan aloqa"))],
         ],
         resize_keyboard=True
     )
 
-def cancel_kb():
+
+def cancel_kb(lang: str):
     return ReplyKeyboardMarkup(
-        keyboard=[[KeyboardButton(text="❌ Отмена")]],
+        keyboard=[[KeyboardButton(text=t(lang, "❌ Отмена", "❌ Bekor qilish"))]],
         resize_keyboard=True
     )
 
-def services_kb():
-    return ReplyKeyboardMarkup(
-        keyboard=[
-            [KeyboardButton(text="🏊 Бассейн"), KeyboardButton(text="🔥 Сауна")],
-            [KeyboardButton(text="💆 Массаж")],
-            [KeyboardButton(text="❌ Отмена")],
-        ],
-        resize_keyboard=True
-    )
+
+def services_kb(lang: str):
+    rows = []
+    for s in SERVICE_BTNS:
+        show = s if lang == "ru" else SERVICE_MAP_UZ.get(s, s)
+        rows.append([KeyboardButton(text=show)])
+    rows.append([KeyboardButton(text=t(lang, "❌ Отмена", "❌ Bekor qilish"))])
+    return ReplyKeyboardMarkup(keyboard=rows, resize_keyboard=True)
+
 
 def req_inline_kb(req_id: int) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
@@ -354,13 +464,16 @@ def req_inline_kb(req_id: int) -> InlineKeyboardMarkup:
     ])
 
 
-# ---------- FSM ----------
-class AdminAddFlow(StatesGroup):
-    waiting_date = State()
-    waiting_time = State()
-    waiting_text = State()
+def client_req_actions_kb(req_id: int, lang: str) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [
+            InlineKeyboardButton(text=t(lang, "❌ Отменить", "❌ Bekor qilish"), callback_data=f"creq:cancel:{req_id}"),
+            InlineKeyboardButton(text=t(lang, "🔁 Перенести", "🔁 Ko‘chirish"), callback_data=f"creq:move:{req_id}"),
+        ]
+    ])
 
-class ClientFlow(StatesGroup):
+
+class ClientNewFlow(StatesGroup):
     waiting_date = State()
     waiting_time = State()
     waiting_name = State()
@@ -368,67 +481,88 @@ class ClientFlow(StatesGroup):
     waiting_service = State()
 
 
-# ---------- Messages RU/UZ ----------
-WAIT_TEXT = (
-    "✅ Ваша заявка отправлена.\n"
-    "⏳ Ожидайте подтверждение администратора.\n"
-    f"☎️ Телефон SPA: {SPA_PHONE}\n\n"
-    "✅ Arizangiz yuborildi.\n"
-    "⏳ Administrator tasdig‘ini kuting.\n"
-    f"☎️ SPA telefoni: {SPA_PHONE}"
-)
-
-CONFIRMED_TEXT = (
-    "✅ Ваша бронь подтверждена!\n"
-    f"☎️ Телефон SPA: {SPA_PHONE}\n\n"
-    "✅ Band qilishingiz tasdiqlandi!\n"
-    f"☎️ SPA telefoni: {SPA_PHONE}"
-)
-
-DECLINED_TEXT = (
-    "❌ К сожалению, бронь отклонена.\n"
-    f"☎️ Телефон SPA: {SPA_PHONE}\n\n"
-    "❌ Afsuski, band qilish rad etildi.\n"
-    f"☎️ SPA telefoni: {SPA_PHONE}"
-)
-
-PHONE_FORMAT_TEXT = (
-    "⚠️ Номер введён неверно.\n"
-    "Введите заново в одном из форматов:\n"
-    f"✅ {EX_PLUS}\n"
-    f"✅ {EX_998}\n"
-    f"✅ {EX_9}\n\n"
-    "⚠️ Telefon raqami noto‘g‘ri.\n"
-    "Quyidagi formatlardan birida kiriting:\n"
-    f"✅ {EX_PLUS}\n"
-    f"✅ {EX_998}\n"
-    f"✅ {EX_9}"
-)
-
-PAST_DATE_TEXT = (
-    "⚠️ Нельзя выбрать прошедшую дату/время. Введите заново.\n\n"
-    "⚠️ O‘tgan sana/vaqtni tanlab bo‘lmaydi. Qayta kiriting."
-)
-
-WORK_HOURS_TEXT = (
-    "⚠️ Мы работаем с 09:00 до 22:00. Введите время заново.\n\n"
-    "⚠️ Ish vaqti 09:00 dan 22:00 gacha. Vaqtni qayta kiriting."
-)
-
-ANTISPAM_TEXT = (
-    "⏳ Слишком часто. Можно отправлять заявку раз в 10 минут.\n"
-    "Попробуйте чуть позже.\n\n"
-    "⏳ Juda tez-tez. 10 daqiqada 1 marta ariza yuborish mumkin.\n"
-    "Birozdan keyin urinib ko‘ring."
-)
-
-CONTACT_TEXT = (
-    f"☎️ Связаться с администратором:\n{SPA_PHONE}\n\n"
-    f"☎️ Administrator bilan bog‘lanish:\n{SPA_PHONE}"
-)
+class ClientMoveFlow(StatesGroup):
+    waiting_date = State()
+    waiting_time = State()
 
 
-# ---------- Bot ----------
+class AdminDeclineFlow(StatesGroup):
+    waiting_comment = State()
+
+
+def phone_format_text(lang: str) -> str:
+    return t(
+        lang,
+        "⚠️ Номер введён неверно.\nВведите заново в одном из форматов:\n"
+        f"✅ {EX_PLUS}\n✅ {EX_998}\n✅ {EX_9}",
+        "⚠️ Telefon raqami noto‘g‘ri.\nQuyidagi formatlardan birida kiriting:\n"
+        f"✅ {EX_PLUS}\n✅ {EX_998}\n✅ {EX_9}",
+    )
+
+
+def past_date_text(lang: str) -> str:
+    return t(
+        lang,
+        "⚠️ Нельзя выбрать прошедшую дату/время. Введите заново.",
+        "⚠️ O‘tgan sana/vaqtni tanlab bo‘lmaydi. Qayta kiriting.",
+    )
+
+
+def work_hours_text(lang: str) -> str:
+    return t(
+        lang,
+        "⚠️ Мы работаем с 09:00 до 22:00. Введите время заново.",
+        "⚠️ Ish vaqti 09:00 dan 22:00 gacha. Vaqtni qayta kiriting.",
+    )
+
+
+def wait_text(lang: str) -> str:
+    return t(
+        lang,
+        f"✅ Ваша заявка отправлена.\n⏳ Ожидайте подтверждение администратора.\n☎️ Телефон SPA: {SPA_PHONE}",
+        f"✅ Arizangiz yuborildi.\n⏳ Administrator tasdig‘ini kuting.\n☎️ SPA telefoni: {SPA_PHONE}",
+    )
+
+
+def confirmed_text(lang: str) -> str:
+    return t(
+        lang,
+        f"✅ Ваша бронь подтверждена!\n☎️ Телефон SPA: {SPA_PHONE}",
+        f"✅ Band qilishingiz tasdiqlandi!\n☎️ SPA telefoni: {SPA_PHONE}",
+    )
+
+
+def declined_text(lang: str, comment: str | None) -> str:
+    comment = (comment or "").strip()
+    if comment:
+        return t(
+            lang,
+            f"❌ К сожалению, бронь отклонена.\nПричина: {comment}\n☎️ Телефон SPA: {SPA_PHONE}",
+            f"❌ Afsuski, band qilish rad etildi.\nSabab: {comment}\n☎️ SPA telefoni: {SPA_PHONE}",
+        )
+    return t(
+        lang,
+        f"❌ К сожалению, бронь отклонена.\n☎️ Телефон SPA: {SPA_PHONE}",
+        f"❌ Afsuski, band qilish rad etildi.\n☎️ SPA telefoni: {SPA_PHONE}",
+    )
+
+
+def antispam_text(lang: str) -> str:
+    return t(
+        lang,
+        "⏳ Слишком часто. Можно отправлять заявку раз в 10 минут. Попробуйте позже.",
+        "⏳ Juda tez-tez. 10 daqiqada 1 marta ariza yuborish mumkin. Keyinroq urinib ko‘ring.",
+    )
+
+
+def contact_text(lang: str) -> str:
+    return t(
+        lang,
+        f"☎️ Связаться с администратором:\n{SPA_PHONE}",
+        f"☎️ Administrator bilan bog‘lanish:\n{SPA_PHONE}",
+    )
+
+
 async def run_bot():
     if not BOT_TOKEN:
         raise RuntimeError("BOT_TOKEN is empty. Set BOT_TOKEN env var.")
@@ -440,7 +574,6 @@ async def run_bot():
     bot = Bot(BOT_TOKEN)
     dp = Dispatcher(storage=MemoryStorage())
 
-    # Scheduler
     scheduler = AsyncIOScheduler(timezone=TZ)
 
     def schedule_morning_job(morning_hhmm: str):
@@ -471,61 +604,246 @@ async def run_bot():
     schedule_morning_job(morning_time)
     scheduler.start()
 
-    # ----------------- START -----------------
     @dp.message(Command("start"))
     async def cmd_start(m: Message, state: FSMContext):
         await state.clear()
+
         if is_admin(m):
             await m.answer("✅ Админ-режим.\nКнопки 👇", reply_markup=admin_kb())
-        else:
-            await m.answer(
-                "Здравствуйте! 👋\nНажмите «📅 Записаться», чтобы отправить заявку.\n\n"
-                "Assalomu alaykum! 👋\n«📅 Yozilish» tugmasini bosing.",
-                reply_markup=client_kb()
-            )
+            return
 
-    # ----------------- COMMON BUTTONS -----------------
-    @dp.message(F.text == "❌ Отмена")
+        user_lang = await get_user_lang(m.from_user.id)
+        if not user_lang:
+            await m.answer("Выберите язык / Tilni tanlang 👇", reply_markup=kb_lang())
+            return
+
+        await m.answer(t(user_lang, "Меню 👇", "Menyu 👇"), reply_markup=client_kb(user_lang))
+
+    @dp.message(F.text.in_(["🇷🇺 Русский", "🇺🇿 Oʻzbek"]))
+    async def choose_lang(m: Message, state: FSMContext):
+        if is_admin(m):
+            return
+        lang = "uz" if m.text == "🇺🇿 Oʻzbek" else "ru"
+        await set_user_lang(m.from_user.id, lang)
+        await state.clear()
+        await m.answer(t(lang, "Язык сохранён ✅", "Til saqlandi ✅"), reply_markup=client_kb(lang))
+
+    @dp.message(F.text.in_(["❌ Отмена", "❌ Bekor qilish"]))
     async def cancel_any(m: Message, state: FSMContext):
         await state.clear()
         if is_admin(m):
-            await m.answer("Ок, отменено ✅", reply_markup=admin_kb())
-        else:
-            await m.answer("Ок ✅", reply_markup=client_kb())
+            await m.answer("Ок ✅", reply_markup=admin_kb())
+            return
+        lang = await get_user_lang(m.from_user.id) or "ru"
+        await m.answer(t(lang, "Ок ✅", "Ok ✅"), reply_markup=client_kb(lang))
 
-    # ----------------- CLIENT: contact -----------------
-    @dp.message(F.text == "☎️ Связаться с админом")
+    @dp.message(F.text.in_(["☎️ Связаться с админом", "☎️ Administrator bilan aloqa"]))
     async def client_contact(m: Message):
         if is_admin(m):
             return
-        await m.answer(CONTACT_TEXT, reply_markup=client_kb())
+        lang = await get_user_lang(m.from_user.id) or "ru"
+        await m.answer(contact_text(lang), reply_markup=client_kb(lang))
 
-    # ----------------- CLIENT: my requests -----------------
-    @dp.message(F.text == "🧾 Мои заявки")
+    @dp.message(F.text.in_(["🧾 Мои заявки", "🧾 Mening arizalarim"]))
     async def client_my_requests(m: Message):
         if is_admin(m):
             return
+        lang = await get_user_lang(m.from_user.id) or "ru"
         rows = await list_requests_for_client(m.from_user.id, MY_REQUESTS_LIMIT)
         if not rows:
-            await m.answer(
-                "У вас пока нет заявок.\n\nSizda hali arizalar yo‘q.",
-                reply_markup=client_kb()
-            )
+            await m.answer(t(lang, "У вас пока нет заявок.", "Sizda hali arizalar yo‘q."), reply_markup=client_kb(lang))
             return
 
         def st_icon(st: str) -> str:
-            return {"pending": "🕓", "confirmed": "✅", "declined": "❌"}.get(st, "•")
+            return {"pending": "🕓", "confirmed": "✅", "declined": "❌", "cancelled": "🚫"}.get(st, "•")
 
-        lines = ["🧾 Ваши заявки (последние):", ""]
+        await m.answer(t(lang, "🧾 Ваши заявки:", "🧾 Sizning arizalaringiz:"), reply_markup=client_kb(lang))
 
-        for rid, ts, text, status, booking_id, created_at in rows:
+        for rid, ts, service, status, booking_id, created_at in rows:
             dt = datetime.fromisoformat(ts)
-            lines.append(f"{st_icon(status)} #{rid} — {dt.strftime('%d.%m %H:%M')} — {text}")
+            line = f"{st_icon(status)} #{rid} — {fmt_dt(dt)} — {service}"
+            if status in ("pending", "confirmed"):
+                await m.answer(line, reply_markup=client_req_actions_kb(rid, lang))
+            else:
+                await m.answer(line)
 
-        lines.append("\n☎️ SPA: " + SPA_PHONE)
-        await m.answer("\n".join(lines), reply_markup=client_kb())
+    @dp.callback_query(F.data.startswith("creq:"))
+    async def client_req_action(cb: CallbackQuery, state: FSMContext):
+        if not cb.from_user:
+            return
+        lang = await get_user_lang(cb.from_user.id) or "ru"
 
-    # ----------------- ADMIN: pending list -----------------
+        parts = (cb.data or "").split(":")
+        if len(parts) != 3 or not parts[2].isdigit():
+            await cb.answer("Error", show_alert=True)
+            return
+        action, rid = parts[1], int(parts[2])
+
+        row = await get_request(rid)
+        if not row:
+            await cb.answer(t(lang, "Заявка не найдена", "Ariza topilmadi"), show_alert=True)
+            return
+
+        (_id, ts, service, name, phone, client_id, chat_id, rlang, status, booking_id, decline_comment, created_at) = row
+        if client_id != cb.from_user.id:
+            await cb.answer(t(lang, "Нет доступа", "Ruxsat yo‘q"), show_alert=True)
+            return
+
+        if status not in ("pending", "confirmed"):
+            await cb.answer(t(lang, "Эту заявку нельзя изменить", "Bu arizani o‘zgartirib bo‘lmaydi"), show_alert=True)
+            return
+
+        if action == "cancel":
+            if booking_id:
+                await delete_booking(int(booking_id))
+            await set_request_status(rid, "cancelled", None, None)
+            await cb.answer(t(lang, "Отменено ✅", "Bekor qilindi ✅"), show_alert=False)
+            return
+
+        if action == "move":
+            await state.clear()
+            await state.set_state(ClientMoveFlow.waiting_date)
+            await state.update_data(move_rid=rid)
+            await cb.answer(t(lang, "Введите новую дату", "Yangi sanani kiriting"), show_alert=False)
+            await cb.message.answer(t(lang, "Введите новую дату ДД.ММ (например 20.02)", "Yangi sana DD.MM (masalan 20.02)"), reply_markup=cancel_kb(lang))
+            return
+
+        await cb.answer("OK")
+
+    @dp.message(F.text.in_(["📅 Записаться", "📅 Yozilish"]))
+    async def client_book_btn(m: Message, state: FSMContext):
+        if is_admin(m):
+            return
+        lang = await get_user_lang(m.from_user.id)
+        if not lang:
+            await m.answer("Выберите язык / Tilni tanlang 👇", reply_markup=kb_lang())
+            return
+
+        left = await antispam_seconds_left(m.from_user.id, ANTISPAM_MINUTES)
+        if left > 0:
+            await m.answer(antispam_text(lang), reply_markup=client_kb(lang))
+            return
+
+        await state.clear()
+        await state.set_state(ClientNewFlow.waiting_date)
+        await m.answer(t(lang, "Введите дату ДД.ММ (например 20.02)", "Sana DD.MM (masalan 20.02)"), reply_markup=cancel_kb(lang))
+
+    @dp.message(ClientNewFlow.waiting_date)
+    async def client_date(m: Message, state: FSMContext):
+        if is_admin(m):
+            return
+        lang = await get_user_lang(m.from_user.id) or "ru"
+        txt = (m.text or "").strip()
+        try:
+            d, mo = parse_ddmm(txt)
+        except Exception:
+            await m.answer(t(lang, "Неверная дата. Пример: 20.02", "Noto‘g‘ri sana. Masalan: 20.02"))
+            return
+
+        now = datetime.now(TZ)
+        candidate = datetime(now.year, mo, d, 0, 0, tzinfo=TZ)
+        if candidate.date() < now.date():
+            await m.answer(past_date_text(lang))
+            return
+
+        await state.update_data(ddmm=txt)
+        await state.set_state(ClientNewFlow.waiting_time)
+        await m.answer(t(lang, "Введите время ЧЧ:ММ (например 14:00)", "Vaqt HH:MM (masalan 14:00)"))
+
+    @dp.message(ClientNewFlow.waiting_time)
+    async def client_time(m: Message, state: FSMContext):
+        if is_admin(m):
+            return
+        lang = await get_user_lang(m.from_user.id) or "ru"
+        txt = (m.text or "").strip()
+        try:
+            tm = parse_hhmm(txt)
+        except Exception:
+            await m.answer(t(lang, "Неверное время. Пример: 14:00", "Noto‘g‘ri vaqt. Masalan: 14:00"))
+            return
+
+        if not in_working_hours(tm):
+            await m.answer(work_hours_text(lang))
+            return
+
+        data = await state.get_data()
+        ddmm = data["ddmm"]
+        dt = make_dt_current_year(ddmm, txt)
+        if dt <= datetime.now(TZ):
+            await m.answer(past_date_text(lang))
+            return
+
+        await state.update_data(hhmm=txt)
+        await state.set_state(ClientNewFlow.waiting_name)
+        await m.answer(t(lang, "Введите имя", "Ismingizni kiriting"))
+
+    @dp.message(ClientNewFlow.waiting_name)
+    async def client_name(m: Message, state: FSMContext):
+        if is_admin(m):
+            return
+        lang = await get_user_lang(m.from_user.id) or "ru"
+        name = (m.text or "").strip()
+        if len(name) < 2:
+            await m.answer(t(lang, "Имя слишком короткое. Введите снова.", "Ism juda qisqa. Qayta kiriting."))
+            return
+        await state.update_data(name=name)
+        await state.set_state(ClientNewFlow.waiting_phone)
+        await m.answer(t(lang, f"Введите номер телефона:\n{EX_PLUS} или {EX_998} или {EX_9}", f"Telefon raqamini kiriting:\n{EX_PLUS} yoki {EX_998} yoki {EX_9}"))
+
+    @dp.message(ClientNewFlow.waiting_phone)
+    async def client_phone(m: Message, state: FSMContext):
+        if is_admin(m):
+            return
+        lang = await get_user_lang(m.from_user.id) or "ru"
+        phone = normalize_uz_phone(m.text or "")
+        if phone is None:
+            await m.answer(phone_format_text(lang))
+            return
+        await state.update_data(phone=phone)
+        await state.set_state(ClientNewFlow.waiting_service)
+        await m.answer(t(lang, "Выберите услугу кнопкой 👇", "Xizmatni tanlang 👇"), reply_markup=services_kb(lang))
+
+    @dp.message(ClientNewFlow.waiting_service)
+    async def client_service(m: Message, state: FSMContext):
+        if is_admin(m):
+            return
+        lang = await get_user_lang(m.from_user.id) or "ru"
+        raw = (m.text or "").strip()
+
+        service_ru = None
+        if raw in SERVICE_MAP_RU:
+            service_ru = raw
+        else:
+            for k_ru, v_uz in SERVICE_MAP_UZ.items():
+                if raw == v_uz:
+                    service_ru = k_ru
+                    break
+
+        if not service_ru:
+            await m.answer(t(lang, "Нажмите кнопку услуги 👇", "Xizmat tugmasini bosing 👇"), reply_markup=services_kb(lang))
+            return
+
+        left = await antispam_seconds_left(m.from_user.id, ANTISPAM_MINUTES)
+        if left > 0:
+            await state.clear()
+            await m.answer(antispam_text(lang), reply_markup=client_kb(lang))
+            return
+
+        data = await state.get_data()
+        ddmm, hhmm = data["ddmm"], data["hhmm"]
+        name, phone = data["name"], data["phone"]
+        dt = make_dt_current_year(ddmm, hhmm)
+
+        req_id = await create_request(dt, service_ru, name, phone, m.from_user.id, m.chat.id, lang)
+        await state.clear()
+        await m.answer(wait_text(lang), reply_markup=client_kb(lang))
+
+        await bot.send_message(
+            ADMIN_ID,
+            f"🆕 Заявка #{req_id}\n🕒 {fmt_dt(dt)}\n👤 Клиент: {m.from_user.full_name} (id {m.from_user.id})\n📝 {service_ru}; {name}; {phone}",
+            reply_markup=req_inline_kb(req_id)
+        )
+
     @dp.message(F.text == "🕓 Ожидающие заявки")
     async def admin_pending(m: Message):
         if not is_admin(m):
@@ -534,22 +852,93 @@ async def run_bot():
         if not rows:
             await m.answer("Нет ожидающих заявок ✅", reply_markup=admin_kb())
             return
-
-        await m.answer(f"🕓 Ожидающие заявки: {len(rows)}", reply_markup=admin_kb())
-        # отправим по сообщениям (удобно нажимать ✅/❌)
-        for rid, ts, text, client_id, created_at in rows:
+        for rid, ts, service, name, phone, client_id, rlang, created_at in rows:
             dt = datetime.fromisoformat(ts)
-            msg = (
-                f"🕓 Заявка #{rid}\n"
-                f"🕒 {dt.strftime('%d.%m %H:%M')}\n"
-                f"👤 client_id: {client_id}\n"
-                f"📝 {text}"
-            )
-            await m.answer(msg, reply_markup=req_inline_kb(rid))
+            await m.answer(f"🕓 #{rid} — {fmt_dt(dt)} — {service}\n{name} {phone}\nclient_id: {client_id}", reply_markup=req_inline_kb(rid))
 
-    # ----------------- ADMIN: today/list/add/del/time -----------------
-    @dp.message(Command("today"))
-    async def cmd_today(m: Message):
+    @dp.callback_query(F.data.startswith("req:"))
+    async def admin_req_action(cb: CallbackQuery, state: FSMContext):
+        if not (cb.from_user and cb.from_user.id == ADMIN_ID):
+            await cb.answer("Нет доступа", show_alert=True)
+            return
+
+        parts = (cb.data or "").split(":")
+        if len(parts) != 3 or not parts[2].isdigit():
+            await cb.answer("Ошибка", show_alert=True)
+            return
+
+        action = parts[1]
+        req_id = int(parts[2])
+
+        row = await get_request(req_id)
+        if not row:
+            await cb.answer("Заявка не найдена", show_alert=True)
+            return
+
+        (_id, ts, service, name, phone, client_id, chat_id, lang, status, booking_id, decline_comment, created_at) = row
+        dt = datetime.fromisoformat(ts)
+
+        if status != "pending":
+            await cb.answer("Уже обработано", show_alert=True)
+            return
+
+        if action == "ok":
+            info = f"{service}; Имя: {name}; Тел: {phone}"
+            bid = await add_booking(dt, info, int(chat_id), int(client_id), lang)
+            await set_request_status(req_id, "confirmed", int(bid), None)
+
+            await cb.answer("Подтверждено ✅")
+            try:
+                await bot.send_message(int(chat_id), confirmed_text(lang) + f"\n📅 {fmt_dt(dt)}")
+            except Exception:
+                pass
+            return
+
+        if action == "no":
+            await state.clear()
+            await state.set_state(AdminDeclineFlow.waiting_comment)
+            await state.update_data(decline_req_id=req_id)
+            await cb.answer("Введите причину отказа", show_alert=False)
+            await cb.message.answer("✍️ Напишите причину отказа (1 сообщением).")
+            return
+
+        await cb.answer("OK")
+
+    @dp.message(AdminDeclineFlow.waiting_comment)
+    async def admin_decline_comment(m: Message, state: FSMContext):
+        if not is_admin(m):
+            return
+        comment = (m.text or "").strip()
+        if len(comment) < 2:
+            await m.answer("Комментарий слишком короткий. Напишите причину одним сообщением.")
+            return
+
+        data = await state.get_data()
+        req_id = int(data["decline_req_id"])
+
+        row = await get_request(req_id)
+        if not row:
+            await state.clear()
+            await m.answer("Заявка не найдена.", reply_markup=admin_kb())
+            return
+
+        (_id, ts, service, name, phone, client_id, chat_id, lang, status, booking_id, decline_comment, created_at) = row
+        if status != "pending":
+            await state.clear()
+            await m.answer("Заявка уже обработана.", reply_markup=admin_kb())
+            return
+
+        await set_request_status(req_id, "declined", None, comment)
+        await state.clear()
+        await m.answer("Ок ✅", reply_markup=admin_kb())
+
+        try:
+            await bot.send_message(int(chat_id), declined_text(lang, comment))
+        except Exception:
+            pass
+
+    @dp.message(F.text == "📅 Сегодня")
+    async def admin_today_btn(m: Message):
         if not is_admin(m):
             return
         today = datetime.now(TZ)
@@ -564,50 +953,11 @@ async def run_bot():
             lines.append(f"#{bid} — {dt.strftime('%H:%M')} — {txt}")
         await m.answer("\n".join(lines), reply_markup=admin_kb())
 
-    @dp.message(F.text == "📅 Сегодня")
-    async def admin_today_btn(m: Message):
-        if is_admin(m):
-            await cmd_today(m)
-
-    @dp.message(Command("list"))
-    async def cmd_list(m: Message):
+    @dp.message(F.text == "ℹ️ Помощь")
+    async def admin_help(m: Message):
         if not is_admin(m):
             return
-        parts = (m.text or "").split(maxsplit=1)
-        if len(parts) != 2:
-            await m.answer("Формат: /list 20.02", reply_markup=admin_kb())
-            return
-        ddmm = parts[1].strip()
-        try:
-            d, mo = parse_ddmm(ddmm)
-            now = datetime.now(TZ)
-            target = datetime(now.year, mo, d, 0, 0, tzinfo=TZ)
-        except Exception:
-            await m.answer("Неверная дата. Пример: /list 20.02", reply_markup=admin_kb())
-            return
-
-        start, end = day_range(target)
-        rows = await list_bookings_between(start, end)
-        if not rows:
-            await m.answer(f"На {ddmm} броней нет ✅", reply_markup=admin_kb())
-            return
-
-        lines = [f"📅 Брони на {ddmm}:"]
-        for bid, ts, txt in rows:
-            dt = datetime.fromisoformat(ts)
-            lines.append(f"#{bid} — {dt.strftime('%H:%M')} — {txt}")
-        await m.answer("\n".join(lines), reply_markup=admin_kb())
-
-    @dp.message(Command("del"))
-    async def cmd_del(m: Message):
-        if not is_admin(m):
-            return
-        parts = (m.text or "").split()
-        if len(parts) != 2 or not parts[1].isdigit():
-            await m.answer("Формат: /del 12", reply_markup=admin_kb())
-            return
-        ok = await delete_booking(int(parts[1]))
-        await m.answer("🗑 Удалено" if ok else "Не найдено", reply_markup=admin_kb())
+        await m.answer("Админ меню:\n🕓 Ожидающие заявки\n📅 Сегодня\n\nКоманда:\n/time HH:MM — время утреннего списка", reply_markup=admin_kb())
 
     @dp.message(Command("time"))
     async def cmd_time(m: Message):
@@ -627,372 +977,12 @@ async def run_bot():
         schedule_morning_job(mt)
         await m.answer(f"✅ Утренний отчёт теперь в {mt}", reply_markup=admin_kb())
 
-    @dp.message(Command("add"))
-    async def cmd_add(m: Message):
-        if not is_admin(m):
-            return
-        mm = re.match(r"^/add\s+(\d{1,2}\.\d{1,2})\s+(\d{1,2}:\d{2})\s+(.+)$", (m.text or "").strip())
-        if not mm:
-            await m.answer("Формат: /add 20.02 14:00 Текст", reply_markup=admin_kb())
-            return
-        ddmm, hhmm, text = mm.group(1), mm.group(2), mm.group(3)
-        try:
-            dt = make_dt_current_year(ddmm, hhmm)
-        except Exception:
-            await m.answer("Неверная дата/время. Пример: /add 20.02 14:00 Текст", reply_markup=admin_kb())
-            return
-
-        bid = await add_booking(dt, text)
-        await m.answer(f"✅ Добавлено: #{bid} — {dt.strftime('%d.%m %H:%M')} — {text}", reply_markup=admin_kb())
-
-    @dp.message(F.text == "📆 На дату")
-    async def admin_list_btn(m: Message, state: FSMContext):
-        if not is_admin(m):
-            return
-        await state.clear()
-        await state.update_data(mode="admin_list")
-        await state.set_state(AdminAddFlow.waiting_date)
-        await m.answer("Введите дату ДД.ММ (например 20.02) или ❌ Отмена", reply_markup=cancel_kb())
-
-    @dp.message(F.text == "➕ Добавить бронь")
-    async def admin_add_btn(m: Message, state: FSMContext):
-        if not is_admin(m):
-            return
-        await state.clear()
-        await state.update_data(mode="admin_add")
-        await state.set_state(AdminAddFlow.waiting_date)
-        await m.answer("Введите дату ДД.ММ (например 20.02) или ❌ Отмена", reply_markup=cancel_kb())
-
-    @dp.message(F.text == "🗑 Удалить")
-    async def admin_del_btn(m: Message, state: FSMContext):
-        if not is_admin(m):
-            return
-        await state.clear()
-        await state.update_data(mode="admin_delete")
-        await m.answer("Введите ID брони для удаления (пример: 12) или ❌ Отмена", reply_markup=cancel_kb())
-
-    @dp.message(F.text == "ℹ️ Помощь")
-    async def admin_help_btn(m: Message):
-        if not is_admin(m):
-            return
-        await m.answer(
-            "Админ команды:\n"
-            "/add ДД.ММ ЧЧ:ММ текст\n"
-            "/today\n"
-            "/list ДД.ММ\n"
-            "/del ID\n"
-            "/time HH:MM\n\n"
-            "Кнопка 🕓 Ожидающие заявки показывает pending заявки.\n"
-            "Напоминания/утренний список идут только по подтверждённым броням (таблица bookings).",
-            reply_markup=admin_kb()
-        )
-
-    # ----------------- CLIENT FLOW: date -> time -> name -> phone -> service(button) -----------------
-    @dp.message(F.text == "📅 Записаться")
-    async def client_book_btn(m: Message, state: FSMContext):
-        if is_admin(m):
-            return
-
-        # anti-spam gate at the start (so even if they cancel mid-way, still ok)
-        left = await has_recent_request(m.from_user.id, ANTISPAM_MINUTES)
-        if left > 0:
-            await m.answer(ANTISPAM_TEXT, reply_markup=client_kb())
-            return
-
-        await state.clear()
-        await state.set_state(ClientFlow.waiting_date)
-        await m.answer("Введите дату ДД.ММ (например 20.02) или ❌ Отмена", reply_markup=cancel_kb())
-
-    @dp.message(ClientFlow.waiting_date)
-    async def client_date(m: Message, state: FSMContext):
-        if is_admin(m):
-            return
-        txt = (m.text or "").strip()
-        try:
-            d, mo = parse_ddmm(txt)
-        except Exception:
-            await m.answer("Неверная дата. Пример: 20.02\n\nNoto‘g‘ri sana. Masalan: 20.02")
-            return
-
-        now = datetime.now(TZ)
-        candidate = datetime(now.year, mo, d, 0, 0, tzinfo=TZ)
-        if candidate.date() < now.date():
-            await m.answer(PAST_DATE_TEXT)
-            return
-
-        await state.update_data(ddmm=txt)
-        await state.set_state(ClientFlow.waiting_time)
-        await m.answer("Введите время ЧЧ:ММ (например 14:00)\n\nVaqtni kiriting (masalan 14:00)")
-
-    @dp.message(ClientFlow.waiting_time)
-    async def client_time(m: Message, state: FSMContext):
-        if is_admin(m):
-            return
-        txt = (m.text or "").strip()
-        try:
-            t = parse_hhmm(txt)
-        except Exception:
-            await m.answer("Неверное время. Пример: 14:00\n\nNoto‘g‘ri vaqt. Masalan: 14:00")
-            return
-
-        if not in_working_hours(t):
-            await m.answer(WORK_HOURS_TEXT)
-            return
-
-        data = await state.get_data()
-        ddmm = data.get("ddmm")
-        try:
-            dt = make_dt_current_year(ddmm, txt)
-        except Exception:
-            await m.answer("Ошибка даты/времени. Введите заново.\n\nSana/vaqt xatosi. Qayta kiriting.")
-            return
-
-        now = datetime.now(TZ)
-        # Запрет прошедшего времени (включая сегодня)
-        if dt <= now:
-            await m.answer(PAST_DATE_TEXT)
-            return
-
-        await state.update_data(hhmm=txt)
-        await state.set_state(ClientFlow.waiting_name)
-        await m.answer("Введите имя\n\nIsmingizni kiriting")
-
-    @dp.message(ClientFlow.waiting_name)
-    async def client_name(m: Message, state: FSMContext):
-        if is_admin(m):
-            return
-        name = (m.text or "").strip()
-        if len(name) < 2:
-            await m.answer("Имя слишком короткое. Введите снова.\n\nIsm juda qisqa. Qayta kiriting.")
-            return
-        await state.update_data(client_name=name)
-        await state.set_state(ClientFlow.waiting_phone)
-        await m.answer(
-            "Введите номер телефона в одном из форматов:\n"
-            f"{EX_PLUS} или {EX_998} или {EX_9}\n\n"
-            "Telefon raqamini quyidagi formatlardan birida kiriting:\n"
-            f"{EX_PLUS} yoki {EX_998} yoki {EX_9}"
-        )
-
-    @dp.message(ClientFlow.waiting_phone)
-    async def client_phone(m: Message, state: FSMContext):
-        if is_admin(m):
-            return
-        phone = normalize_uz_phone(m.text or "")
-        if phone is None:
-            await m.answer(PHONE_FORMAT_TEXT)
-            return
-        await state.update_data(phone=phone)
-        await state.set_state(ClientFlow.waiting_service)
-        await m.answer(
-            "Выберите услугу кнопкой 👇\n\nXizmatni tanlang 👇",
-            reply_markup=services_kb()
-        )
-
-    @dp.message(ClientFlow.waiting_service)
-    async def client_service(m: Message, state: FSMContext):
-        if is_admin(m):
-            return
-        choice = (m.text or "").strip()
-        if choice not in SERVICES:
-            await m.answer("Пожалуйста нажмите кнопку услуги 👇\n\nIltimos tugmani bosing 👇", reply_markup=services_kb())
-            return
-
-        # антиспам прямо перед созданием (на случай если юзер обошёл через /start)
-        left = await has_recent_request(m.from_user.id, ANTISPAM_MINUTES)
-        if left > 0:
-            await state.clear()
-            await m.answer(ANTISPAM_TEXT, reply_markup=client_kb())
-            return
-
-        data = await state.get_data()
-        ddmm = data.get("ddmm")
-        hhmm = data.get("hhmm")
-        name = data.get("client_name")
-        phone = data.get("phone")
-        service = SERVICES[choice]
-
-        try:
-            dt = make_dt_current_year(ddmm, hhmm)
-        except Exception:
-            await state.clear()
-            await m.answer("Ошибка даты/времени. Попробуйте снова.", reply_markup=client_kb())
-            return
-
-        now = datetime.now(TZ)
-        if dt <= now:
-            await state.clear()
-            await m.answer(PAST_DATE_TEXT, reply_markup=client_kb())
-            return
-
-        req_text = f"Услуга: {service}; Имя: {name}; Тел: {phone}"
-
-        req_id = await create_request(dt, req_text, m.from_user.id, m.chat.id)
-        await state.clear()
-
-        await m.answer(WAIT_TEXT, reply_markup=client_kb())
-
-        admin_msg = (
-            f"🆕 Заявка #{req_id}\n"
-            f"🕒 {dt.strftime('%d.%m %H:%M')}\n"
-            f"👤 Клиент: {m.from_user.full_name} (id {m.from_user.id})\n"
-            f"📝 {req_text}"
-        )
-        await bot.send_message(ADMIN_ID, admin_msg, reply_markup=req_inline_kb(req_id))
-
-    # ----------------- ADMIN CONFIRM/DECLINE -----------------
-    @dp.callback_query(F.data.startswith("req:"))
-    async def req_action(cb: CallbackQuery):
-        if not (cb.from_user and cb.from_user.id == ADMIN_ID):
-            await cb.answer("Нет доступа", show_alert=True)
-            return
-
-        parts = (cb.data or "").split(":")
-        if len(parts) != 3:
-            await cb.answer("Ошибка кнопки", show_alert=True)
-            return
-
-        action, req_id_s = parts[1], parts[2]
-        if not req_id_s.isdigit():
-            await cb.answer("Ошибка id", show_alert=True)
-            return
-
-        req_id = int(req_id_s)
-        row = await get_request(req_id)
-        if not row:
-            await cb.answer("Заявка не найдена", show_alert=True)
-            return
-
-        _id, ts, text, client_id, chat_id, status, booking_id, created_at = row
-        dt = datetime.fromisoformat(ts)
-
-        if status != "pending":
-            await cb.answer("Уже обработано", show_alert=True)
-            return
-
-        if action == "ok":
-            bid = await add_booking(dt, text)
-            await set_request_status(req_id, "confirmed", int(bid))
-            await cb.message.answer(f"✅ Заявка #{req_id} подтверждена. Создана бронь #{bid} на {dt.strftime('%d.%m %H:%M')}.")
-            await cb.answer("Подтверждено ✅")
-            await bot.send_message(chat_id, CONFIRMED_TEXT + f"\n\n📅 {dt.strftime('%d.%m %H:%M')}")
-            return
-
-        if action == "no":
-            await set_request_status(req_id, "declined", None)
-            await cb.message.answer(f"❌ Заявка #{req_id} отклонена.")
-            await cb.answer("Отклонено ❌")
-            await bot.send_message(chat_id, DECLINED_TEXT)
-            return
-
-        await cb.answer("Неизвестное действие", show_alert=True)
-
-    # ----------------- ADMIN wizards + delete mode -----------------
-    @dp.message(AdminAddFlow.waiting_date)
-    async def admin_flow_date(m: Message, state: FSMContext):
-        if not is_admin(m):
-            return
-        txt = (m.text or "").strip()
-        data = await state.get_data()
-        mode = data.get("mode")
-
-        if mode not in ("admin_add", "admin_list"):
-            await state.clear()
-            await m.answer("Режим сброшен. /start", reply_markup=admin_kb())
-            return
-
-        try:
-            parse_ddmm(txt)
-        except Exception:
-            await m.answer("Неверная дата. Пример: 20.02")
-            return
-
-        if mode == "admin_list":
-            await state.clear()
-            d, mo = parse_ddmm(txt)
-            now = datetime.now(TZ)
-            target = datetime(now.year, mo, d, 0, 0, tzinfo=TZ)
-            start, end = day_range(target)
-            rows = await list_bookings_between(start, end)
-            if not rows:
-                await m.answer(f"На {txt} броней нет ✅", reply_markup=admin_kb())
-                return
-            lines = [f"📅 Брони на {txt}:"]
-            for bid, ts, t2 in rows:
-                dt = datetime.fromisoformat(ts)
-                lines.append(f"#{bid} — {dt.strftime('%H:%M')} — {t2}")
-            await m.answer("\n".join(lines), reply_markup=admin_kb())
-            return
-
-        await state.update_data(ddmm=txt)
-        await state.set_state(AdminAddFlow.waiting_time)
-        await m.answer("Введите время ЧЧ:ММ (например 14:00) или ❌ Отмена", reply_markup=cancel_kb())
-
-    @dp.message(AdminAddFlow.waiting_time)
-    async def admin_flow_time(m: Message, state: FSMContext):
-        if not is_admin(m):
-            return
-        txt = (m.text or "").strip()
-        try:
-            parse_hhmm(txt)
-        except Exception:
-            await m.answer("Неверное время. Пример: 14:00")
-            return
-        await state.update_data(hhmm=txt)
-        await state.set_state(AdminAddFlow.waiting_text)
-        await m.answer("Введите текст брони (услуга/имя/телефон) или ❌ Отмена", reply_markup=cancel_kb())
-
-    @dp.message(AdminAddFlow.waiting_text)
-    async def admin_flow_text(m: Message, state: FSMContext):
-        if not is_admin(m):
-            return
-        text = (m.text or "").strip()
-        if not text:
-            await m.answer("Текст не должен быть пустым.")
-            return
-
-        data = await state.get_data()
-        ddmm, hhmm = data.get("ddmm"), data.get("hhmm")
-
-        try:
-            dt = make_dt_current_year(ddmm, hhmm)
-        except Exception:
-            await state.clear()
-            await m.answer("Ошибка даты/времени. Начните заново.", reply_markup=admin_kb())
-            return
-
-        bid = await add_booking(dt, text)
-        await state.clear()
-        await m.answer(f"✅ Добавлено: #{bid} — {dt.strftime('%d.%m %H:%M')} — {text}", reply_markup=admin_kb())
-
-    @dp.message()
-    async def fallback(m: Message, state: FSMContext):
-        data = await state.get_data()
-        mode = data.get("mode")
-
-        if mode == "admin_delete" and is_admin(m):
-            txt = (m.text or "").strip()
-            if not txt.isdigit():
-                await m.answer("Введите ID цифрами (пример: 12) или ❌ Отмена", reply_markup=cancel_kb())
-                return
-            ok = await delete_booking(int(txt))
-            await state.clear()
-            await m.answer("🗑 Удалено" if ok else "Не найдено", reply_markup=admin_kb())
-            return
-
-        if is_admin(m):
-            await m.answer("Нажмите кнопку или /start для меню.", reply_markup=admin_kb())
-        else:
-            await m.answer("Нажмите «📅 Записаться» или /start.", reply_markup=client_kb())
-
     await dp.start_polling(bot)
 
 
 async def main():
-    await asyncio.gather(
-        run_web_server(),
-        run_bot()
-    )
+    await asyncio.gather(run_web_server(), run_bot())
+
 
 if __name__ == "__main__":
     asyncio.run(main())
