@@ -6,7 +6,14 @@ from datetime import datetime, timedelta, time as dtime
 import aiosqlite
 from aiogram import Bot, Dispatcher, F
 from aiogram.filters import Command
-from aiogram.types import Message, ReplyKeyboardMarkup, KeyboardButton
+from aiogram.types import (
+    Message,
+    ReplyKeyboardMarkup,
+    KeyboardButton,
+    InlineKeyboardMarkup,
+    InlineKeyboardButton,
+    CallbackQuery,
+)
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.storage.memory import MemoryStorage
@@ -27,6 +34,8 @@ PORT = int(os.getenv("PORT", "10000"))
 
 TZ = ZoneInfo(TZ_NAME)
 DB_PATH = "bookings.db"
+
+SPA_PHONE = "+998916768900"
 
 
 # ---------- Helpers ----------
@@ -57,7 +66,7 @@ def make_dt(ddmm: str, hhmm: str) -> datetime:
     now = datetime.now(TZ)
     year = now.year
     dt = datetime(year, month, day, tm.hour, tm.minute, tzinfo=TZ)
-    # If date already passed - use next year
+    # if date already passed -> next year
     if dt < now - timedelta(days=1):
         dt = dt.replace(year=year + 1)
     return dt
@@ -80,8 +89,21 @@ async def init_db():
             created_at TEXT NOT NULL
         )
         """)
-        # запрет одинакового времени (одинакового ts)
-        await db.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_bookings_ts_unique ON bookings(ts)")
+        # ВАЖНО: больше НЕ создаём UNIQUE индекс на ts (разрешаем одинаковое время)
+
+        await db.execute("""
+        CREATE TABLE IF NOT EXISTS requests (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            ts TEXT NOT NULL,               -- requested time
+            text TEXT NOT NULL,             -- client text: service/name/phone/etc
+            client_id INTEGER NOT NULL,     -- telegram user id
+            chat_id INTEGER NOT NULL,       -- where to reply
+            status TEXT NOT NULL,           -- pending/confirmed/declined
+            booking_id INTEGER,             -- filled when confirmed
+            created_at TEXT NOT NULL
+        )
+        """)
+
         await db.execute("""
         CREATE TABLE IF NOT EXISTS settings (
             key TEXT PRIMARY KEY,
@@ -110,17 +132,14 @@ async def set_setting(key: str, value: str):
         await db.commit()
 
 async def add_booking(dt: datetime, info: str):
-    # returns (ok, id_or_error)
-    try:
-        async with aiosqlite.connect(DB_PATH) as db:
-            cur = await db.execute(
-                "INSERT INTO bookings(ts, text, reminded, created_at) VALUES(?,?,0,?)",
-                (dt.isoformat(), info, datetime.now(TZ).isoformat())
-            )
-            await db.commit()
-            return True, cur.lastrowid
-    except aiosqlite.IntegrityError:
-        return False, "busy"
+    # Всегда добавляем (даже если одинаковое время)
+    async with aiosqlite.connect(DB_PATH) as db:
+        cur = await db.execute(
+            "INSERT INTO bookings(ts, text, reminded, created_at) VALUES(?,?,0,?)",
+            (dt.isoformat(), info, datetime.now(TZ).isoformat())
+        )
+        await db.commit()
+        return cur.lastrowid
 
 async def delete_booking(bid: int) -> bool:
     async with aiosqlite.connect(DB_PATH) as db:
@@ -136,8 +155,33 @@ async def list_bookings_between(start: datetime, end: datetime):
         ) as cur:
             return await cur.fetchall()
 
+async def create_request(dt: datetime, text: str, client_id: int, chat_id: int) -> int:
+    async with aiosqlite.connect(DB_PATH) as db:
+        cur = await db.execute(
+            "INSERT INTO requests(ts, text, client_id, chat_id, status, created_at) VALUES(?,?,?,?, 'pending', ?)",
+            (dt.isoformat(), text, client_id, chat_id, datetime.now(TZ).isoformat())
+        )
+        await db.commit()
+        return cur.lastrowid
 
-# ---------- Notifications ----------
+async def get_request(req_id: int):
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute(
+            "SELECT id, ts, text, client_id, chat_id, status, booking_id FROM requests WHERE id=?",
+            (req_id,)
+        ) as cur:
+            return await cur.fetchone()
+
+async def set_request_status(req_id: int, status: str, booking_id: int | None = None):
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            "UPDATE requests SET status=?, booking_id=? WHERE id=?",
+            (status, booking_id, req_id)
+        )
+        await db.commit()
+
+
+# ---------- Notifications (ONLY confirmed/admin-added bookings) ----------
 async def send_today_summary(bot: Bot):
     today = datetime.now(TZ)
     start, end = day_range(today)
@@ -192,13 +236,8 @@ async def run_web_server():
     await site.start()
 
 
-# ---------- UI / FSM ----------
-class AddFlow(StatesGroup):
-    waiting_date = State()
-    waiting_time = State()
-    waiting_text = State()
-
-def main_kb():
+# ---------- Keyboards ----------
+def admin_kb():
     return ReplyKeyboardMarkup(
         keyboard=[
             [KeyboardButton(text="➕ Добавить бронь"), KeyboardButton(text="📅 Сегодня")],
@@ -208,11 +247,62 @@ def main_kb():
         resize_keyboard=True
     )
 
+def client_kb():
+    return ReplyKeyboardMarkup(
+        keyboard=[[KeyboardButton(text="📅 Записаться")]],
+        resize_keyboard=True
+    )
+
 def cancel_kb():
     return ReplyKeyboardMarkup(
         keyboard=[[KeyboardButton(text="❌ Отмена")]],
         resize_keyboard=True
     )
+
+def req_inline_kb(req_id: int) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [
+            InlineKeyboardButton(text="✅ Подтвердить", callback_data=f"req:ok:{req_id}"),
+            InlineKeyboardButton(text="❌ Отклонить", callback_data=f"req:no:{req_id}"),
+        ]
+    ])
+
+
+# ---------- FSM ----------
+class AdminAddFlow(StatesGroup):
+    waiting_date = State()
+    waiting_time = State()
+    waiting_text = State()
+
+class ClientFlow(StatesGroup):
+    waiting_date = State()
+    waiting_time = State()
+    waiting_text = State()
+
+
+# ---------- Messages RU/UZ ----------
+WAIT_TEXT = (
+    "✅ Ваша заявка отправлена.\n"
+    "⏳ Ожидайте подтверждение администратора.\n"
+    f"☎️ Телефон SPA: {SPA_PHONE}\n\n"
+    "✅ Arizangiz yuborildi.\n"
+    "⏳ Administrator tasdig‘ini kuting.\n"
+    f"☎️ SPA telefoni: {SPA_PHONE}"
+)
+
+CONFIRMED_TEXT = (
+    "✅ Ваша бронь подтверждена!\n"
+    f"☎️ Телефон SPA: {SPA_PHONE}\n\n"
+    "✅ Band qilishingiz tasdiqlandi!\n"
+    f"☎️ SPA telefoni: {SPA_PHONE}"
+)
+
+DECLINED_TEXT = (
+    "❌ К сожалению, бронь отклонена.\n"
+    f"☎️ Телефон SPA: {SPA_PHONE}\n\n"
+    "❌ Afsuski, band qilish rad etildi.\n"
+    f"☎️ SPA telefoni: {SPA_PHONE}"
+)
 
 
 # ---------- Bot ----------
@@ -227,10 +317,10 @@ async def run_bot():
     bot = Bot(BOT_TOKEN)
     dp = Dispatcher(storage=MemoryStorage())
 
+    # Scheduler
     scheduler = AsyncIOScheduler(timezone=TZ)
 
     def schedule_morning_job(morning_hhmm: str):
-        # remove old job if exists
         try:
             scheduler.remove_job("morning_summary")
         except Exception:
@@ -246,10 +336,8 @@ async def run_bot():
             replace_existing=True
         )
 
-    # periodic reminders
     scheduler.add_job(send_one_hour_reminders, "interval", minutes=1, args=[bot])
 
-    # morning summary time from DB (or default)
     morning_time = (await get_setting("morning_time")) or MORNING_TIME_DEFAULT
     try:
         parse_hhmm(morning_time)
@@ -260,25 +348,27 @@ async def run_bot():
     schedule_morning_job(morning_time)
     scheduler.start()
 
-    # ---- Commands ----
+    # ----------------- START -----------------
     @dp.message(Command("start"))
     async def cmd_start(m: Message, state: FSMContext):
-        if not is_admin(m):
-            return
         await state.clear()
-        await m.answer(
-            "✅ Бот бронирования.\n\n"
-            "Работа через кнопки 👇\n\n"
-            "Команды (если нужно):\n"
-            "/add ДД.ММ ЧЧ:ММ текст\n"
-            "/today\n"
-            "/list ДД.ММ\n"
-            "/del ID\n"
-            "/time HH:MM\n\n"
-            "🚫 Запрет пересечения: нельзя ставить 2 брони на одно и то же время.",
-            reply_markup=main_kb()
-        )
+        if is_admin(m):
+            await m.answer(
+                "✅ Админ-режим.\n\n"
+                "Кнопки 👇\n"
+                "ℹ️ Теперь разрешены одинаковые времена старта (если нужно).",
+                reply_markup=admin_kb()
+            )
+        else:
+            await m.answer(
+                "Здравствуйте! 👋\n"
+                "Нажмите «📅 Записаться», чтобы отправить заявку.\n\n"
+                "Assalomu alaykum! 👋\n"
+                "«📅 Yozilish» tugmasini bosing.",
+                reply_markup=client_kb()
+            )
 
+    # ----------------- ADMIN COMMANDS -----------------
     @dp.message(Command("today"))
     async def cmd_today(m: Message):
         if not is_admin(m):
@@ -287,13 +377,13 @@ async def run_bot():
         start, end = day_range(today)
         rows = await list_bookings_between(start, end)
         if not rows:
-            await m.answer("Сегодня броней нет ✅", reply_markup=main_kb())
+            await m.answer("Сегодня броней нет ✅", reply_markup=admin_kb())
             return
         lines = ["📅 Брони на сегодня:"]
         for bid, ts, txt in rows:
             dt = datetime.fromisoformat(ts)
             lines.append(f"#{bid} — {dt.strftime('%H:%M')} — {txt}")
-        await m.answer("\n".join(lines), reply_markup=main_kb())
+        await m.answer("\n".join(lines), reply_markup=admin_kb())
 
     @dp.message(Command("list"))
     async def cmd_list(m: Message):
@@ -301,30 +391,28 @@ async def run_bot():
             return
         parts = (m.text or "").split(maxsplit=1)
         if len(parts) != 2:
-            await m.answer("Формат: /list 20.02", reply_markup=main_kb())
+            await m.answer("Формат: /list 20.02", reply_markup=admin_kb())
             return
-
         ddmm = parts[1].strip()
         try:
             d, mo = parse_ddmm(ddmm)
             now = datetime.now(TZ)
             target = datetime(now.year, mo, d, 0, 0, tzinfo=TZ)
         except Exception:
-            await m.answer("Неверная дата. Пример: /list 20.02", reply_markup=main_kb())
+            await m.answer("Неверная дата. Пример: /list 20.02", reply_markup=admin_kb())
             return
 
         start, end = day_range(target)
         rows = await list_bookings_between(start, end)
-
         if not rows:
-            await m.answer(f"На {ddmm} броней нет ✅", reply_markup=main_kb())
+            await m.answer(f"На {ddmm} броней нет ✅", reply_markup=admin_kb())
             return
 
         lines = [f"📅 Брони на {ddmm}:"]
         for bid, ts, txt in rows:
             dt = datetime.fromisoformat(ts)
             lines.append(f"#{bid} — {dt.strftime('%H:%M')} — {txt}")
-        await m.answer("\n".join(lines), reply_markup=main_kb())
+        await m.answer("\n".join(lines), reply_markup=admin_kb())
 
     @dp.message(Command("del"))
     async def cmd_del(m: Message):
@@ -332,10 +420,10 @@ async def run_bot():
             return
         parts = (m.text or "").split()
         if len(parts) != 2 or not parts[1].isdigit():
-            await m.answer("Формат: /del 12", reply_markup=main_kb())
+            await m.answer("Формат: /del 12", reply_markup=admin_kb())
             return
         ok = await delete_booking(int(parts[1]))
-        await m.answer("🗑 Удалено" if ok else "Не найдено", reply_markup=main_kb())
+        await m.answer("🗑 Удалено" if ok else "Не найдено", reply_markup=admin_kb())
 
     @dp.message(Command("time"))
     async def cmd_time(m: Message):
@@ -343,17 +431,17 @@ async def run_bot():
             return
         parts = (m.text or "").split()
         if len(parts) != 2:
-            await m.answer("Формат: /time 09:00", reply_markup=main_kb())
+            await m.answer("Формат: /time 09:00", reply_markup=admin_kb())
             return
         try:
             mt = parts[1].strip()
             parse_hhmm(mt)
         except Exception:
-            await m.answer("Неверное время. Пример: /time 09:00", reply_markup=main_kb())
+            await m.answer("Неверное время. Пример: /time 09:00", reply_markup=admin_kb())
             return
         await set_setting("morning_time", mt)
-        schedule_morning_job(mt)  # apply immediately
-        await m.answer(f"✅ Утренний отчёт теперь в {mt}", reply_markup=main_kb())
+        schedule_morning_job(mt)
+        await m.answer(f"✅ Утренний отчёт теперь в {mt}", reply_markup=admin_kb())
 
     @dp.message(Command("add"))
     async def cmd_add(m: Message):
@@ -361,91 +449,209 @@ async def run_bot():
             return
         mm = re.match(r"^/add\s+(\d{1,2}\.\d{1,2})\s+(\d{1,2}:\d{2})\s+(.+)$", (m.text or "").strip())
         if not mm:
-            await m.answer("Формат: /add 20.02 14:00 Текст", reply_markup=main_kb())
+            await m.answer("Формат: /add 20.02 14:00 Текст", reply_markup=admin_kb())
             return
         ddmm, hhmm, text = mm.group(1), mm.group(2), mm.group(3)
         try:
             dt = make_dt(ddmm, hhmm)
         except Exception:
-            await m.answer("Неверная дата/время. Пример: /add 20.02 14:00 Текст", reply_markup=main_kb())
+            await m.answer("Неверная дата/время. Пример: /add 20.02 14:00 Текст", reply_markup=admin_kb())
             return
 
-        ok, res = await add_booking(dt, text)
-        if not ok and res == "busy":
-            await m.answer(f"⚠️ На {dt.strftime('%d.%m')} в {dt.strftime('%H:%M')} уже есть бронь.", reply_markup=main_kb())
-            return
-        await m.answer(f"✅ Добавлено: #{res} — {dt.strftime('%d.%m %H:%M')} — {text}", reply_markup=main_kb())
+        bid = await add_booking(dt, text)
+        await m.answer(f"✅ Добавлено: #{bid} — {dt.strftime('%d.%m %H:%M')} — {text}", reply_markup=admin_kb())
 
-    # ---- Buttons ----
+    # ----------------- ADMIN BUTTONS -----------------
+    @dp.message(F.text == "📅 Сегодня")
+    async def admin_today_btn(m: Message):
+        if is_admin(m):
+            await cmd_today(m)
+
+    @dp.message(F.text == "📆 На дату")
+    async def admin_list_btn(m: Message, state: FSMContext):
+        if not is_admin(m):
+            return
+        await state.clear()
+        await state.update_data(mode="admin_list")
+        await state.set_state(AdminAddFlow.waiting_date)
+        await m.answer("Введите дату ДД.ММ (например 20.02) или ❌ Отмена", reply_markup=cancel_kb())
+
+    @dp.message(F.text == "🗑 Удалить")
+    async def admin_del_btn(m: Message, state: FSMContext):
+        if not is_admin(m):
+            return
+        await state.clear()
+        await state.update_data(mode="admin_delete")
+        await m.answer("Введите ID брони для удаления (пример: 12) или ❌ Отмена", reply_markup=cancel_kb())
+
+    @dp.message(F.text == "➕ Добавить бронь")
+    async def admin_add_btn(m: Message, state: FSMContext):
+        if not is_admin(m):
+            return
+        await state.clear()
+        await state.update_data(mode="admin_add")
+        await state.set_state(AdminAddFlow.waiting_date)
+        await m.answer("Введите дату ДД.ММ (например 20.02) или ❌ Отмена", reply_markup=cancel_kb())
+
     @dp.message(F.text == "ℹ️ Помощь")
-    async def help_btn(m: Message):
+    async def admin_help_btn(m: Message):
         if not is_admin(m):
             return
         await m.answer(
-            "Кнопки:\n"
-            "➕ Добавить бронь — пошаговое добавление\n"
-            "📅 Сегодня — список броней\n"
-            "📆 На дату — список на дату\n"
-            "🗑 Удалить — удалить по ID\n\n"
-            "Команды:\n"
+            "Админ команды:\n"
             "/add ДД.ММ ЧЧ:ММ текст\n"
             "/today\n"
             "/list ДД.ММ\n"
             "/del ID\n"
             "/time HH:MM\n\n"
-            "🚫 Запрет пересечения: нельзя ставить 2 брони на одно и то же время.",
-            reply_markup=main_kb()
+            "Заявки от клиентов приходят с кнопками ✅/❌.\n"
+            "ℹ️ Одинаковое время старта разрешено.",
+            reply_markup=admin_kb()
         )
 
-    @dp.message(F.text == "📅 Сегодня")
-    async def today_btn(m: Message):
-        await cmd_today(m)
-
-    @dp.message(F.text == "➕ Добавить бронь")
-    async def add_btn(m: Message, state: FSMContext):
-        if not is_admin(m):
+    # ----------------- CLIENT MODE (REQUESTS) -----------------
+    @dp.message(F.text == "📅 Записаться")
+    async def client_book_btn(m: Message, state: FSMContext):
+        if is_admin(m):
             return
         await state.clear()
-        await state.set_state(AddFlow.waiting_date)
-        await m.answer("Введите дату ДД.ММ (например 20.02) или нажмите ❌ Отмена", reply_markup=cancel_kb())
-
-    @dp.message(F.text == "📆 На дату")
-    async def list_date_btn(m: Message, state: FSMContext):
-        if not is_admin(m):
-            return
-        await state.clear()
-        await state.update_data(mode="list_only")
-        await state.set_state(AddFlow.waiting_date)
-        await m.answer("Введите дату ДД.ММ (например 20.02) или нажмите ❌ Отмена", reply_markup=cancel_kb())
-
-    @dp.message(F.text == "🗑 Удалить")
-    async def del_btn(m: Message, state: FSMContext):
-        if not is_admin(m):
-            return
-        await state.clear()
-        await state.update_data(mode="delete")
-        await m.answer("Введите ID брони для удаления (пример: 12) или ❌ Отмена", reply_markup=cancel_kb())
+        await state.set_state(ClientFlow.waiting_date)
+        await m.answer("Введите дату ДД.ММ (например 20.02) или ❌ Отмена", reply_markup=cancel_kb())
 
     @dp.message(F.text == "❌ Отмена")
     async def cancel_any(m: Message, state: FSMContext):
-        if not is_admin(m):
-            return
         await state.clear()
-        await m.answer("Ок, отменено ✅", reply_markup=main_kb())
+        if is_admin(m):
+            await m.answer("Ок, отменено ✅", reply_markup=admin_kb())
+        else:
+            await m.answer("Ок ✅", reply_markup=client_kb())
 
-    # ---- FSM handlers ----
-    @dp.message(AddFlow.waiting_date)
-    async def fsm_date(m: Message, state: FSMContext):
+    @dp.message(ClientFlow.waiting_date)
+    async def client_date(m: Message, state: FSMContext):
+        if is_admin(m):
+            return
+        txt = (m.text or "").strip()
+        try:
+            parse_ddmm(txt)
+        except Exception:
+            await m.answer("Неверная дата. Пример: 20.02\n\nNoto‘g‘ri sana. Masalan: 20.02")
+            return
+        await state.update_data(ddmm=txt)
+        await state.set_state(ClientFlow.waiting_time)
+        await m.answer("Введите время ЧЧ:ММ (например 14:00)\n\nVaqtni kiriting (masalan 14:00)")
+
+    @dp.message(ClientFlow.waiting_time)
+    async def client_time(m: Message, state: FSMContext):
+        if is_admin(m):
+            return
+        txt = (m.text or "").strip()
+        try:
+            parse_hhmm(txt)
+        except Exception:
+            await m.answer("Неверное время. Пример: 14:00\n\nNoto‘g‘ri vaqt. Masalan: 14:00")
+            return
+        await state.update_data(hhmm=txt)
+        await state.set_state(ClientFlow.waiting_text)
+        await m.answer(
+            "Напишите текст заявки (услуга, имя, телефон)\n"
+            "Пример: Массаж, Алишер, +998...\n\n"
+            "Ariza matnini yozing (xizmat, ism, telefon)"
+        )
+
+    @dp.message(ClientFlow.waiting_text)
+    async def client_text(m: Message, state: FSMContext):
+        if is_admin(m):
+            return
+        text = (m.text or "").strip()
+        if not text:
+            await m.answer("Текст не должен быть пустым.\n\nMatn bo‘sh bo‘lmasin.")
+            return
+
+        data = await state.get_data()
+        ddmm, hhmm = data.get("ddmm"), data.get("hhmm")
+
+        try:
+            dt = make_dt(ddmm, hhmm)
+        except Exception:
+            await state.clear()
+            await m.answer("Ошибка даты/времени. Попробуйте снова.", reply_markup=client_kb())
+            return
+
+        req_id = await create_request(dt, text, m.from_user.id, m.chat.id)
+        await state.clear()
+
+        # client: wait message RU+UZ + phone
+        await m.answer(WAIT_TEXT, reply_markup=client_kb())
+
+        # admin: request + approve/decline buttons
+        admin_msg = (
+            f"🆕 Заявка #{req_id}\n"
+            f"🕒 {dt.strftime('%d.%m %H:%M')}\n"
+            f"👤 Клиент: {m.from_user.full_name} (id {m.from_user.id})\n"
+            f"📝 {text}\n\n"
+            f"ℹ️ Одинаковое время старта разрешено."
+        )
+        await bot.send_message(ADMIN_ID, admin_msg, reply_markup=req_inline_kb(req_id))
+
+    # ----------------- ADMIN CONFIRM/DECLINE -----------------
+    @dp.callback_query(F.data.startswith("req:"))
+    async def req_action(cb: CallbackQuery):
+        if not (cb.from_user and cb.from_user.id == ADMIN_ID):
+            await cb.answer("Нет доступа", show_alert=True)
+            return
+
+        parts = (cb.data or "").split(":")
+        if len(parts) != 3:
+            await cb.answer("Ошибка кнопки", show_alert=True)
+            return
+
+        action, req_id_s = parts[1], parts[2]
+        if not req_id_s.isdigit():
+            await cb.answer("Ошибка id", show_alert=True)
+            return
+
+        req_id = int(req_id_s)
+        row = await get_request(req_id)
+        if not row:
+            await cb.answer("Заявка не найдена", show_alert=True)
+            return
+
+        _id, ts, text, client_id, chat_id, status, booking_id = row
+        dt = datetime.fromisoformat(ts)
+
+        if status != "pending":
+            await cb.answer("Уже обработано", show_alert=True)
+            return
+
+        if action == "ok":
+            bid = await add_booking(dt, text)
+            await set_request_status(req_id, "confirmed", int(bid))
+            await cb.message.answer(f"✅ Заявка #{req_id} подтверждена. Создана бронь #{bid} на {dt.strftime('%d.%m %H:%M')}.")
+            await cb.answer("Подтверждено ✅")
+            await bot.send_message(chat_id, CONFIRMED_TEXT + f"\n\n📅 {dt.strftime('%d.%m %H:%M')}")
+            return
+
+        if action == "no":
+            await set_request_status(req_id, "declined", None)
+            await cb.message.answer(f"❌ Заявка #{req_id} отклонена.")
+            await cb.answer("Отклонено ❌")
+            await bot.send_message(chat_id, DECLINED_TEXT)
+            return
+
+        await cb.answer("Неизвестное действие", show_alert=True)
+
+    # ----------------- ADMIN LIST/ADD wizard + ADMIN DELETE mode -----------------
+    @dp.message(AdminAddFlow.waiting_date)
+    async def admin_flow_date(m: Message, state: FSMContext):
         if not is_admin(m):
             return
         txt = (m.text or "").strip()
         data = await state.get_data()
         mode = data.get("mode")
 
-        # If delete mode - should not be here
-        if mode == "delete":
+        if mode not in ("admin_add", "admin_list"):
             await state.clear()
-            await m.answer("Ошибка режима. Нажмите 🗑 Удалить ещё раз.", reply_markup=main_kb())
+            await m.answer("Режим сброшен. /start", reply_markup=admin_kb())
             return
 
         try:
@@ -454,33 +660,30 @@ async def run_bot():
             await m.answer("Неверная дата. Пример: 20.02")
             return
 
-        # FIXED: list-only mode WITHOUT creating fake Message
-        if mode == "list_only":
+        if mode == "admin_list":
             await state.clear()
             d, mo = parse_ddmm(txt)
             now = datetime.now(TZ)
             target = datetime(now.year, mo, d, 0, 0, tzinfo=TZ)
             start, end = day_range(target)
             rows = await list_bookings_between(start, end)
-
             if not rows:
-                await m.answer(f"На {txt} броней нет ✅", reply_markup=main_kb())
+                await m.answer(f"На {txt} броней нет ✅", reply_markup=admin_kb())
                 return
-
             lines = [f"📅 Брони на {txt}:"]
             for bid, ts, t2 in rows:
                 dt = datetime.fromisoformat(ts)
                 lines.append(f"#{bid} — {dt.strftime('%H:%M')} — {t2}")
-            await m.answer("\n".join(lines), reply_markup=main_kb())
+            await m.answer("\n".join(lines), reply_markup=admin_kb())
             return
 
-        # add flow
+        # admin_add flow continues
         await state.update_data(ddmm=txt)
-        await state.set_state(AddFlow.waiting_time)
+        await state.set_state(AdminAddFlow.waiting_time)
         await m.answer("Введите время ЧЧ:ММ (например 14:00) или ❌ Отмена", reply_markup=cancel_kb())
 
-    @dp.message(AddFlow.waiting_time)
-    async def fsm_time(m: Message, state: FSMContext):
+    @dp.message(AdminAddFlow.waiting_time)
+    async def admin_flow_time(m: Message, state: FSMContext):
         if not is_admin(m):
             return
         txt = (m.text or "").strip()
@@ -490,58 +693,51 @@ async def run_bot():
             await m.answer("Неверное время. Пример: 14:00")
             return
         await state.update_data(hhmm=txt)
-        await state.set_state(AddFlow.waiting_text)
-        await m.answer("Введите текст брони (услуга/имя/телефон и т.д.) или ❌ Отмена", reply_markup=cancel_kb())
+        await state.set_state(AdminAddFlow.waiting_text)
+        await m.answer("Введите текст брони (услуга/имя/телефон) или ❌ Отмена", reply_markup=cancel_kb())
 
-    @dp.message(AddFlow.waiting_text)
-    async def fsm_text(m: Message, state: FSMContext):
+    @dp.message(AdminAddFlow.waiting_text)
+    async def admin_flow_text(m: Message, state: FSMContext):
         if not is_admin(m):
             return
         text = (m.text or "").strip()
         if not text:
-            await m.answer("Текст не должен быть пустым. Напишите описание брони.")
+            await m.answer("Текст не должен быть пустым.")
             return
 
         data = await state.get_data()
-        ddmm = data.get("ddmm")
-        hhmm = data.get("hhmm")
+        ddmm, hhmm = data.get("ddmm"), data.get("hhmm")
 
         try:
             dt = make_dt(ddmm, hhmm)
         except Exception:
             await state.clear()
-            await m.answer("Ошибка даты/времени. Начните заново: ➕ Добавить бронь", reply_markup=main_kb())
+            await m.answer("Ошибка даты/времени. Начните заново.", reply_markup=admin_kb())
             return
 
-        ok, res = await add_booking(dt, text)
+        bid = await add_booking(dt, text)
         await state.clear()
+        await m.answer(f"✅ Добавлено: #{bid} — {dt.strftime('%d.%m %H:%M')} — {text}", reply_markup=admin_kb())
 
-        if not ok and res == "busy":
-            await m.answer(
-                f"⚠️ На {dt.strftime('%d.%m')} в {dt.strftime('%H:%M')} уже есть бронь.\nВыберите другое время.",
-                reply_markup=main_kb()
-            )
-            return
-
-        await m.answer(f"✅ Добавлено: #{res} — {dt.strftime('%d.%m %H:%M')} — {text}", reply_markup=main_kb())
-
-    # delete mode handler (catch-all)
     @dp.message()
     async def fallback(m: Message, state: FSMContext):
-        if not is_admin(m):
-            return
         data = await state.get_data()
-        if data.get("mode") == "delete":
+        mode = data.get("mode")
+
+        if mode == "admin_delete" and is_admin(m):
             txt = (m.text or "").strip()
             if not txt.isdigit():
-                await m.answer("Введите только ID цифрами (пример: 12) или ❌ Отмена", reply_markup=cancel_kb())
+                await m.answer("Введите ID цифрами (пример: 12) или ❌ Отмена", reply_markup=cancel_kb())
                 return
             ok = await delete_booking(int(txt))
             await state.clear()
-            await m.answer("🗑 Удалено" if ok else "Не найдено", reply_markup=main_kb())
+            await m.answer("🗑 Удалено" if ok else "Не найдено", reply_markup=admin_kb())
             return
 
-        await m.answer("Нажмите кнопку или /start для меню.", reply_markup=main_kb())
+        if is_admin(m):
+            await m.answer("Нажмите кнопку или /start для меню.", reply_markup=admin_kb())
+        else:
+            await m.answer("Нажмите «📅 Записаться» или /start.", reply_markup=client_kb())
 
     await dp.start_polling(bot)
 
