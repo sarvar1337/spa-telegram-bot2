@@ -13,6 +13,10 @@ from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.fsm.state import State, StatesGroup
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from zoneinfo import ZoneInfo
+from aiohttp import web
+from dotenv import load_dotenv
+
+load_dotenv()
 
 # ---------------- ENV ----------------
 BOT_TOKEN = (os.getenv("BOT_TOKEN") or "").strip()
@@ -21,6 +25,8 @@ MORNING_TIME = (os.getenv("MORNING_TIME") or "09:00").strip()
 
 PIN_RECEPTION = (os.getenv("PIN_RECEPTION") or "").strip()  # 10 digits
 PIN_SPA = (os.getenv("PIN_SPA") or "").strip()              # 10 digits
+
+PORT = int(os.getenv("PORT", "10000"))
 
 TZ = ZoneInfo(TZ_NAME)
 DB_PATH = "hotel_bot.db"
@@ -35,7 +41,100 @@ CAT_SPA = "spa"
 OPEN_TIME = dtime(9, 0)
 CLOSE_TIME = dtime(22, 0)
 
-# ---------------- HELPERS ----------------
+PHONE_RECEPTION = "+998906338900"   # бронь комнаты
+PHONE_SPA = "+998916768900"         # бронь SPA
+
+# ---------------- i18n ----------------
+TXT = {
+    "ru": {
+        "hello_choose_lang": "Здравствуйте! 👋\nВыберите язык / Tilni tanlang:",
+        "menu": "Выберите действие:",
+        "btn_room": "🏨 Бронь комнаты",
+        "btn_spa": "🧖 Запись в SPA",
+        "btn_contact": "📞 Связь с админом",
+        "btn_my": "📄 Мои заявки",
+        "contact_room": f"📞 Администратор по брони комнат: {PHONE_RECEPTION}",
+        "contact_spa": f"📞 Администратор SPA: {PHONE_SPA}",
+        "room_start": "🏨 Бронь комнаты\nНапишите заявку одним сообщением (ФИО, даты, пожелания, телефон).",
+        "spa_start": "🧖 Запись в SPA\nВведите дату ДД.ММ (например 20.02):",
+        "spa_time": "Введите время ЧЧ:ММ (например 14:00):",
+        "spa_text": "Напишите детали заявки (услуга/имя/телефон/комната если есть):",
+        "sent_room": f"✅ Заявка отправлена администратору.\nЕсли срочно — звоните: {PHONE_RECEPTION}",
+        "sent_spa": f"✅ Заявка отправлена администратору.\nОжидайте подтверждение.\nЕсли срочно — звоните: {PHONE_SPA}",
+        "bad_date": "❌ Неверная дата. Пример: 20.02",
+        "past_date": "⚠️ Прошедшую дату нельзя. Введите снова:",
+        "bad_time": "❌ Неверное время. Пример: 14:00",
+        "work_hours": "⚠️ Рабочие часы 09:00–22:00. Введите время заново:",
+        "empty": "❌ Сообщение пустое. Введите снова:",
+        "my_none": "У вас пока нет заявок.",
+        "my_title": "📄 Ваши заявки:",
+        "admin_panel_reception": "✅ Панель: Ресепшен",
+        "admin_panel_spa": "✅ Панель: SPA",
+        "logout": "Вы вышли ✅",
+        "need_room": "Введите номер комнаты (например 101):",
+        "need_amount": "Введите сумму (только цифры), например 50000:",
+        "need_note": "Комментарий (или '-' если не нужно):",
+        "folio_enter_room": "Введите номер комнаты:",
+        "bad_room": "❌ Неверный номер комнаты. Введите только цифры (например 101):",
+        "bad_amount": "❌ Неверная сумма. Введите только цифры (например 50000):",
+        "folio_empty": "Записей нет.",
+        "today_none": "Сегодня броней нет ✅",
+        "ask_ddmm": "Введите дату ДД.ММ (например 20.02):",
+        "ask_delete_id": "Введите ID брони (например 12):",
+        "deleted": "✅ Удалено",
+        "not_found": "⚠️ Не найдено",
+        "only_number": "❌ Нужно число. Например 12:",
+        "added_booking": "✅ Бронь добавлена:",
+        "on_date_none": "На эту дату броней нет ✅",
+    },
+    "uz": {
+        "hello_choose_lang": "Assalomu alaykum! 👋\nTilni tanlang / Выберите язык:",
+        "menu": "Amalni tanlang:",
+        "btn_room": "🏨 Xona bron qilish",
+        "btn_spa": "🧖 SPA yozilish",
+        "btn_contact": "📞 Administrator bilan aloqa",
+        "btn_my": "📄 Mening arizalarim",
+        "contact_room": f"📞 Xona bo‘yicha administrator: {PHONE_RECEPTION}",
+        "contact_spa": f"📞 SPA administrator: {PHONE_SPA}",
+        "room_start": "🏨 Xona bron qilish\nArizani bitta xabarda yozing (F.I.Sh, sanalar, telefon).",
+        "spa_start": "🧖 SPA yozilish\nSana kiriting DD.MM (masalan 20.02):",
+        "spa_time": "Vaqt kiriting HH:MM (masalan 14:00):",
+        "spa_text": "Ariza tafsilotlarini yozing (xizmat/ism/telefon/xona bo‘lsa):",
+        "sent_room": f"✅ Ariza yuborildi.\nShoshilinch bo‘lsa qo‘ng‘iroq qiling: {PHONE_RECEPTION}",
+        "sent_spa": f"✅ Ariza yuborildi.\nTasdiqlashni kuting.\nShoshilinch bo‘lsa qo‘ng‘iroq qiling: {PHONE_SPA}",
+        "bad_date": "❌ Sana noto‘g‘ri. Masalan: 20.02",
+        "past_date": "⚠️ O‘tgan sanani kiritib bo‘lmaydi. Qaytadan kiriting:",
+        "bad_time": "❌ Vaqt noto‘g‘ri. Masalan: 14:00",
+        "work_hours": "⚠️ Ish vaqti 09:00–22:00. Qaytadan kiriting:",
+        "empty": "❌ Bo‘sh. Qaytadan kiriting:",
+        "my_none": "Hozircha arizalar yo‘q.",
+        "my_title": "📄 Arizalaringiz:",
+        "admin_panel_reception": "✅ Panel: Resepshen",
+        "admin_panel_spa": "✅ Panel: SPA",
+        "logout": "Chiqdingiz ✅",
+        "need_room": "Xona raqamini kiriting (masalan 101):",
+        "need_amount": "Summani kiriting (faqat raqam), masalan 50000:",
+        "need_note": "Izoh (yoki '-' bo‘lsa kerak emas):",
+        "folio_enter_room": "Xona raqamini kiriting:",
+        "bad_room": "❌ Xona raqami noto‘g‘ri. Faqat raqam (masalan 101):",
+        "bad_amount": "❌ Summa noto‘g‘ri. Faqat raqam (masalan 50000):",
+        "folio_empty": "Yozuvlar yo‘q.",
+        "today_none": "Bugun bronlar yo‘q ✅",
+        "ask_ddmm": "Sana kiriting DD.MM (masalan 20.02):",
+        "ask_delete_id": "Bron ID kiriting (masalan 12):",
+        "deleted": "✅ O‘chirildi",
+        "not_found": "⚠️ Topilmadi",
+        "only_number": "❌ Raqam bo‘lishi kerak. Masalan 12:",
+        "added_booking": "✅ Bron qo‘shildi:",
+        "on_date_none": "Bu sanada bron yo‘q ✅",
+    }
+}
+
+def t(lang: str, key: str) -> str:
+    lang = lang if lang in TXT else "ru"
+    return TXT[lang].get(key, key)
+
+# ---------------- helpers ----------------
 def now_tz() -> datetime:
     return datetime.now(TZ)
 
@@ -74,9 +173,6 @@ def day_range(day: datetime):
     end = start + timedelta(days=1)
     return start, end
 
-def fmt_dt(dt: datetime) -> str:
-    return dt.strftime("%d.%m %H:%M")
-
 def in_working_hours(tm: dtime) -> bool:
     return OPEN_TIME <= tm <= CLOSE_TIME
 
@@ -95,10 +191,21 @@ def parse_amount(s: str) -> int:
         raise ValueError("Bad amount")
     return v
 
-# ---------------- KEYBOARDS ----------------
-def kb_auth():
+# ---------------- Keyboards ----------------
+def kb_lang():
     return ReplyKeyboardMarkup(
-        keyboard=[[KeyboardButton(text="🔐 Войти (код)")]],
+        keyboard=[
+            [KeyboardButton(text="🇷🇺 Русский"), KeyboardButton(text="🇺🇿 O‘zbek")],
+        ],
+        resize_keyboard=True
+    )
+
+def kb_client(lang: str):
+    return ReplyKeyboardMarkup(
+        keyboard=[
+            [KeyboardButton(text=t(lang, "btn_room")), KeyboardButton(text=t(lang, "btn_spa"))],
+            [KeyboardButton(text=t(lang, "btn_my")), KeyboardButton(text=t(lang, "btn_contact"))],
+        ],
         resize_keyboard=True
     )
 
@@ -124,8 +231,16 @@ def kb_spa():
     )
 
 # ---------------- FSM ----------------
-class AuthFlow(StatesGroup):
-    waiting_pin = State()
+class ChooseLangFlow(StatesGroup):
+    waiting_lang = State()
+
+class RoomRequestFlow(StatesGroup):
+    waiting_text = State()
+
+class SpaRequestFlow(StatesGroup):
+    waiting_date = State()
+    waiting_time = State()
+    waiting_text = State()
 
 class SpaAddBookingFlow(StatesGroup):
     waiting_date = State()
@@ -148,18 +263,38 @@ class FolioViewFlow(StatesGroup):
 
 # ---------------- DB ----------------
 async def init_db():
+    # pins must be 10 digits
+    if not (is_10_digits(PIN_RECEPTION) and is_10_digits(PIN_SPA)):
+        raise RuntimeError("PIN_RECEPTION и PIN_SPA должны быть ровно 10 цифр (Render Environment).")
+
     async with aiosqlite.connect(DB_PATH) as db:
         await db.execute("""
         CREATE TABLE IF NOT EXISTS users (
             user_id INTEGER PRIMARY KEY,
-            role TEXT NOT NULL,
-            created_at TEXT NOT NULL
+            role TEXT,
+            created_at TEXT
         )""")
 
         await db.execute("""
         CREATE TABLE IF NOT EXISTS pins (
             role TEXT PRIMARY KEY,
             pin_hash TEXT NOT NULL
+        )""")
+
+        await db.execute("""
+        CREATE TABLE IF NOT EXISTS prefs (
+            user_id INTEGER PRIMARY KEY,
+            lang TEXT NOT NULL
+        )""")
+
+        await db.execute("""
+        CREATE TABLE IF NOT EXISTS client_requests (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER NOT NULL,
+            kind TEXT NOT NULL,           -- room/spa
+            ts TEXT NOT NULL,             -- desired datetime or created time
+            text TEXT NOT NULL,
+            created_at TEXT NOT NULL
         )""")
 
         await db.execute("""
@@ -183,15 +318,9 @@ async def init_db():
             created_by_user INTEGER,
             created_at TEXT NOT NULL
         )""")
-        await db.commit()
 
-    # pins
-    if not (is_10_digits(PIN_RECEPTION) and is_10_digits(PIN_SPA)):
-        raise RuntimeError("PIN_RECEPTION и PIN_SPA должны быть ровно 10 цифр (Environment Variables в Render).")
-
-    async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute("INSERT OR REPLACE INTO pins(role,pin_hash) VALUES(?,?)", (ROLE_RECEPTION, sha256(PIN_RECEPTION)))
-        await db.execute("INSERT OR REPLACE INTO pins(role,pin_hash) VALUES(?,?)", (ROLE_SPA, sha256(PIN_SPA)))
+        await db.execute("INSERT OR REPLACE INTO pins(role, pin_hash) VALUES(?,?)", (ROLE_RECEPTION, sha256(PIN_RECEPTION)))
+        await db.execute("INSERT OR REPLACE INTO pins(role, pin_hash) VALUES(?,?)", (ROLE_SPA, sha256(PIN_SPA)))
         await db.commit()
 
 async def get_role(user_id: int) -> str | None:
@@ -211,7 +340,7 @@ async def set_role(user_id: int, role: str):
 
 async def clear_role(user_id: int):
     async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute("DELETE FROM users WHERE user_id=?", (user_id,))
+        await db.execute("UPDATE users SET role=NULL WHERE user_id=?", (user_id,))
         await db.commit()
 
 async def check_pin(pin: str) -> str | None:
@@ -221,9 +350,46 @@ async def check_pin(pin: str) -> str | None:
             row = await cur.fetchone()
             return row[0] if row else None
 
-async def get_all_admin_users():
+async def set_lang(user_id: int, lang: str):
+    lang = lang if lang in ("ru", "uz") else "ru"
     async with aiosqlite.connect(DB_PATH) as db:
-        async with db.execute("SELECT user_id, role FROM users") as cur:
+        await db.execute(
+            "INSERT INTO prefs(user_id, lang) VALUES(?,?) "
+            "ON CONFLICT(user_id) DO UPDATE SET lang=excluded.lang",
+            (user_id, lang),
+        )
+        await db.commit()
+
+async def get_lang(user_id: int) -> str | None:
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute("SELECT lang FROM prefs WHERE user_id=?", (user_id,)) as cur:
+            row = await cur.fetchone()
+            return row[0] if row else None
+
+async def list_admins(role: str | None = None):
+    async with aiosqlite.connect(DB_PATH) as db:
+        if role:
+            async with db.execute("SELECT user_id FROM users WHERE role=?", (role,)) as cur:
+                return [int(r[0]) for r in await cur.fetchall()]
+        else:
+            async with db.execute("SELECT user_id FROM users WHERE role IS NOT NULL") as cur:
+                return [int(r[0]) for r in await cur.fetchall()]
+
+async def add_client_request(user_id: int, kind: str, ts: str, text: str) -> int:
+    async with aiosqlite.connect(DB_PATH) as db:
+        cur = await db.execute(
+            "INSERT INTO client_requests(user_id, kind, ts, text, created_at) VALUES(?,?,?,?,?)",
+            (user_id, kind, ts, text, now_tz().isoformat()),
+        )
+        await db.commit()
+        return cur.lastrowid
+
+async def list_my_requests(user_id: int, limit: int = 30):
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute(
+            "SELECT id, kind, ts, text, created_at FROM client_requests WHERE user_id=? ORDER BY created_at DESC LIMIT ?",
+            (user_id, limit),
+        ) as cur:
             return await cur.fetchall()
 
 async def add_booking(dt: datetime, text: str, created_by: int | None) -> int:
@@ -285,32 +451,32 @@ async def folio_total_by_room(room: str) -> int:
             row = await cur.fetchone()
             return int(row[0] or 0)
 
-# ---------------- NOTIFICATIONS ----------------
+# ---------------- Notifications ----------------
 async def send_today_bookings(bot: Bot):
-    admins = await get_all_admin_users()
+    admins = await list_admins()  # кто уже вошёл как админ хотя бы раз
     if not admins:
         return
+
     today = now_tz()
     start, end = day_range(today)
     rows = await list_bookings_between(start, end)
 
-    if not rows:
-        msg = "📅 Сегодня броней SPA нет ✅"
-    else:
+    msg = "📅 Сегодня броней SPA нет ✅"
+    if rows:
         lines = ["📅 Брони SPA на сегодня:"]
         for bid, ts, txt in rows:
             dt = datetime.fromisoformat(ts)
             lines.append(f"#{bid} — {dt.strftime('%H:%M')} — {txt}")
         msg = "\n".join(lines)
 
-    for uid, _role in admins:
+    for uid in admins:
         try:
-            await bot.send_message(int(uid), msg)
+            await bot.send_message(uid, msg)
         except Exception:
             pass
 
 async def send_one_hour_reminders(bot: Bot):
-    admins = await get_all_admin_users()
+    admins = await list_admins()
     if not admins:
         return
 
@@ -323,18 +489,35 @@ async def send_one_hour_reminders(bot: Bot):
         if reminded:
             continue
         dt = datetime.fromisoformat(ts)
-        msg = f"⏰ Через 1 час бронь SPA: {fmt_dt(dt)} — {txt} (#{bid})"
-        for uid, _role in admins:
+        msg = f"⏰ Через 1 час бронь SPA: {dt.strftime('%d.%m %H:%M')} — {txt} (#{bid})"
+        for uid in admins:
             try:
-                await bot.send_message(int(uid), msg)
+                await bot.send_message(uid, msg)
             except Exception:
                 pass
         await mark_booking_reminded(int(bid))
 
-# ---------------- BOT ----------------
-async def main():
+# ---------------- Render Web server (for Web Service) ----------------
+async def handle_root(_request):
+    return web.Response(text="OK")
+
+async def handle_healthz(_request):
+    return web.Response(text="OK")
+
+async def run_web_server():
+    app = web.Application()
+    app.router.add_get("/", handle_root)
+    app.router.add_get("/healthz", handle_healthz)
+
+    runner = web.AppRunner(app)
+    await runner.setup()
+    site = web.TCPSite(runner, "0.0.0.0", PORT)
+    await site.start()
+
+# ---------------- Main bot ----------------
+async def run_bot():
     if not BOT_TOKEN:
-        raise RuntimeError("BOT_TOKEN пустой. Добавь BOT_TOKEN в Environment Variables Render.")
+        raise RuntimeError("BOT_TOKEN пустой (Render Environment).")
 
     await init_db()
 
@@ -347,326 +530,512 @@ async def main():
     scheduler.add_job(send_one_hour_reminders, "interval", minutes=1, args=[bot], id="reminders", replace_existing=True)
     scheduler.start()
 
-    async def show_menu(m: Message):
+    async def show_client_menu(m: Message, lang: str):
+        await m.answer(t(lang, "menu"), reply_markup=kb_client(lang))
+
+    async def ensure_lang_or_ask(m: Message, state: FSMContext) -> str | None:
+        lang = await get_lang(m.from_user.id)
+        if lang:
+            return lang
+        await state.clear()
+        await state.set_state(ChooseLangFlow.waiting_lang)
+        await m.answer(TXT["ru"]["hello_choose_lang"], reply_markup=kb_lang())
+        return None
+
+    async def admin_or_client_menu(m: Message, state: FSMContext):
         role = await get_role(m.from_user.id)
         if role == ROLE_RECEPTION:
-            await m.answer("✅ Панель: Ресепшен", reply_markup=kb_reception())
-        elif role == ROLE_SPA:
-            await m.answer("✅ Панель: SPA", reply_markup=kb_spa())
-        else:
-            await m.answer("🔐 Нажмите кнопку и введите 10-значный код.", reply_markup=kb_auth())
+            await m.answer(TXT["ru"]["admin_panel_reception"], reply_markup=kb_reception())
+            return
+        if role == ROLE_SPA:
+            await m.answer(TXT["ru"]["admin_panel_spa"], reply_markup=kb_spa())
+            return
 
+        lang = await ensure_lang_or_ask(m, state)
+        if not lang:
+            return
+        await show_client_menu(m, lang)
+
+    # /start
     @dp.message(Command("start"))
     async def start(m: Message, state: FSMContext):
         await state.clear()
-        await show_menu(m)
+        await admin_or_client_menu(m, state)
 
+    # language selection
+    @dp.message(ChooseLangFlow.waiting_lang)
+    async def choose_lang(m: Message, state: FSMContext):
+        text = (m.text or "").strip()
+        if "Рус" in text:
+            lang = "ru"
+        elif "O‘z" in text or "Uz" in text or "ўз" in text.lower():
+            lang = "uz"
+        else:
+            await m.answer(TXT["ru"]["hello_choose_lang"], reply_markup=kb_lang())
+            return
+
+        await set_lang(m.from_user.id, lang)
+        await state.clear()
+        await show_client_menu(m, lang)
+
+    # Admin secret PIN: send 10 digits anytime (no hints for clients)
+    @dp.message(F.text.regexp(r"^\d{10}$"))
+    async def secret_pin(m: Message, state: FSMContext):
+        pin = (m.text or "").strip()
+        role = await check_pin(pin)
+        if role:
+            await set_role(m.from_user.id, role)
+            await state.clear()
+            if role == ROLE_RECEPTION:
+                await m.answer(TXT["ru"]["admin_panel_reception"], reply_markup=kb_reception())
+            else:
+                await m.answer(TXT["ru"]["admin_panel_spa"], reply_markup=kb_spa())
+            return
+        # если это просто 10 цифр (не PIN) — ведём как обычное сообщение:
+        await admin_or_client_menu(m, state)
+
+    # Admin logout
     @dp.message(F.text == "🚪 Выйти")
-    async def logout(m: Message, state: FSMContext):
+    async def admin_logout(m: Message, state: FSMContext):
         await state.clear()
         await clear_role(m.from_user.id)
-        await m.answer("Вы вышли ✅", reply_markup=kb_auth())
-
-    @dp.message(F.text == "🔐 Войти (код)")
-    async def auth_btn(m: Message, state: FSMContext):
-        await state.clear()
-        await state.set_state(AuthFlow.waiting_pin)
-        await m.answer("Введите 10-значный код (10 цифр):")
-
-    @dp.message(AuthFlow.waiting_pin)
-    async def auth_pin(m: Message, state: FSMContext):
-        pin = (m.text or "").strip()
-        if not is_10_digits(pin):
-            await m.answer("❌ Нужно ровно 10 цифр. Введите ещё раз:")
+        # вернём в клиентское меню
+        lang = await ensure_lang_or_ask(m, state)
+        if not lang:
             return
-        role = await check_pin(pin)
-        if not role:
-            await m.answer("❌ Неверный код. Попробуйте ещё раз:")
-            return
-        await set_role(m.from_user.id, role)
-        await state.clear()
-        await show_menu(m)
+        await m.answer(t(lang, "logout"), reply_markup=kb_client(lang))
 
-    # --------- FOLIO ADD (reception restaurant/laundry, spa can add spa) ---------
-    async def start_folio_add(m: Message, state: FSMContext, category: str):
+    # ---------------- CLIENT MENU ----------------
+    @dp.message()
+    async def router(m: Message, state: FSMContext):
         role = await get_role(m.from_user.id)
-        if role not in (ROLE_RECEPTION, ROLE_SPA):
-            return await show_menu(m)
 
-        if category in (CAT_RESTAURANT, CAT_LAUNDRY) and role != ROLE_RECEPTION:
-            await m.answer("❌ Это может делать только Ресепшен.", reply_markup=kb_spa())
+        # ---------- ADMIN ROUTES ----------
+        if role == ROLE_RECEPTION:
+            return await reception_routes(m, state)
+        if role == ROLE_SPA:
+            return await spa_routes(m, state)
+
+        # ---------- CLIENT ROUTES ----------
+        lang = await ensure_lang_or_ask(m, state)
+        if not lang:
             return
 
-        await state.clear()
-        await state.set_state(FolioAddFlow.waiting_room)
-        await state.update_data(category=category, created_by_role=role)
-        await m.answer("Введите номер комнаты (только цифры), например 101:")
+        txt = (m.text or "").strip()
 
-    @dp.message(F.text == "➕ Счёт: Ресторан")
-    async def add_rest(m: Message, state: FSMContext):
-        await start_folio_add(m, state, CAT_RESTAURANT)
-
-    @dp.message(F.text == "➕ Счёт: Прачка")
-    async def add_laundry(m: Message, state: FSMContext):
-        await start_folio_add(m, state, CAT_LAUNDRY)
-
-    @dp.message(F.text == "➕ Счёт: SPA (фолио)")
-    async def add_spa_folio(m: Message, state: FSMContext):
-        await start_folio_add(m, state, CAT_SPA)
-
-    @dp.message(FolioAddFlow.waiting_room)
-    async def folio_room(m: Message, state: FSMContext):
-        try:
-            room = parse_room(m.text)
-        except Exception:
-            await m.answer("❌ Неверный номер комнаты. Введите только цифры:")
+        if txt == t(lang, "btn_contact"):
+            # общая связь (для комнаты)
+            await m.answer(t(lang, "contact_room"), reply_markup=kb_client(lang))
             return
-        await state.update_data(room=room)
-        await state.set_state(FolioAddFlow.waiting_amount)
-        await m.answer("Введите сумму (только цифры), например 50000:")
 
-    @dp.message(FolioAddFlow.waiting_amount)
-    async def folio_amount(m: Message, state: FSMContext):
-        try:
-            amount = parse_amount(m.text)
-        except Exception:
-            await m.answer("❌ Неверная сумма. Введите только цифры:")
-            return
-        await state.update_data(amount=amount)
-        await state.set_state(FolioAddFlow.waiting_note)
-        await m.answer("Комментарий (или '-' если не нужно):")
-
-    @dp.message(FolioAddFlow.waiting_note)
-    async def folio_note(m: Message, state: FSMContext):
-        data = await state.get_data()
-        category = data["category"]
-        room = data["room"]
-        amount = int(data["amount"])
-        role = data["created_by_role"]
-
-        note = (m.text or "").strip()
-        if note == "-" or note == "":
-            note = None
-
-        fid = await folio_add(room, category, amount, note, role, m.from_user.id)
-        total = await folio_total_by_room(room)
-        await state.clear()
-
-        await m.answer(
-            f"✅ Добавлено (#{fid})\nКомната: {room}\nКатегория: {category}\nСумма: {amount}\nИтого по комнате: {total}",
-            reply_markup=kb_reception() if role == ROLE_RECEPTION else kb_spa(),
-        )
-
-    # --------- FOLIO VIEW ---------
-    @dp.message(F.text == "📄 Фолио по номеру")
-    async def folio_view_btn(m: Message, state: FSMContext):
-        role = await get_role(m.from_user.id)
-        if role not in (ROLE_RECEPTION, ROLE_SPA):
-            return await show_menu(m)
-        await state.clear()
-        await state.set_state(FolioViewFlow.waiting_room)
-        await m.answer("Введите номер комнаты:")
-
-    @dp.message(FolioViewFlow.waiting_room)
-    async def folio_view_room(m: Message, state: FSMContext):
-        role = await get_role(m.from_user.id)
-        if role not in (ROLE_RECEPTION, ROLE_SPA):
+        if txt == t(lang, "btn_room"):
             await state.clear()
-            return await show_menu(m)
-
-        try:
-            room = parse_room(m.text)
-        except Exception:
-            await m.answer("❌ Неверный номер. Введите только цифры:")
+            await state.set_state(RoomRequestFlow.waiting_text)
+            await m.answer(t(lang, "room_start"))
             return
 
-        rows = await folio_list_by_room(room, limit=50)
-        total = await folio_total_by_room(room)
-        await state.clear()
-
-        if not rows:
-            await m.answer(f"Комната {room}: записей нет.\nИтого: {total}",
-                           reply_markup=kb_reception() if role == ROLE_RECEPTION else kb_spa())
-            return
-
-        lines = [f"📄 Фолио комнаты {room} (итого: {total})"]
-        for fid, cat, amt, note, by_role, created_at in rows:
-            dt = datetime.fromisoformat(created_at).astimezone(TZ)
-            extra = f" — {note}" if note else ""
-            lines.append(f"#{fid} | {cat} | {amt} | {dt.strftime('%d.%m %H:%M')} ({by_role}){extra}")
-        await m.answer("\n".join(lines),
-                       reply_markup=kb_reception() if role == ROLE_RECEPTION else kb_spa())
-
-    # --------- SPA BOOKINGS ---------
-    @dp.message(F.text == "➕ Добавить бронь")
-    async def spa_add_booking_btn(m: Message, state: FSMContext):
-        role = await get_role(m.from_user.id)
-        if role != ROLE_SPA:
-            return await show_menu(m)
-        await state.clear()
-        await state.set_state(SpaAddBookingFlow.waiting_date)
-        await m.answer("Введите дату ДД.ММ (например 20.02):")
-
-    @dp.message(SpaAddBookingFlow.waiting_date)
-    async def spa_add_date(m: Message, state: FSMContext):
-        role = await get_role(m.from_user.id)
-        if role != ROLE_SPA:
+        if txt == t(lang, "btn_spa"):
             await state.clear()
-            return await show_menu(m)
+            await state.set_state(SpaRequestFlow.waiting_date)
+            await m.answer(t(lang, "spa_start"))
+            return
 
+        if txt == t(lang, "btn_my"):
+            rows = await list_my_requests(m.from_user.id)
+            if not rows:
+                await m.answer(t(lang, "my_none"), reply_markup=kb_client(lang))
+                return
+            lines = [t(lang, "my_title")]
+            for rid, kind, ts, text2, created_at in rows:
+                kind_name = "SPA" if kind == "spa" else ("ROOM" if kind == "room" else kind)
+                lines.append(f"#{rid} [{kind_name}] {ts} — {text2}")
+            await m.answer("\n".join(lines), reply_markup=kb_client(lang))
+            return
+
+        # if none matched -> show menu
+        await show_client_menu(m, lang)
+
+    # ---------------- CLIENT FLOWS ----------------
+    @dp.message(RoomRequestFlow.waiting_text)
+    async def room_request_text(m: Message, state: FSMContext):
+        lang = await get_lang(m.from_user.id) or "ru"
+        text = (m.text or "").strip()
+        if not text:
+            await m.answer(t(lang, "empty"))
+            return
+
+        rid = await add_client_request(m.from_user.id, "room", now_tz().strftime("%d.%m %H:%M"), text)
+
+        # forward to reception admins (who have logged in at least once)
+        admins = await list_admins(ROLE_RECEPTION)
+        fwd = f"🏨 ROOM REQUEST #{rid}\nFrom: {m.from_user.id}\nText: {text}"
+        for uid in admins:
+            try:
+                await m.bot.send_message(uid, fwd)
+            except Exception:
+                pass
+
+        await state.clear()
+        await m.answer(t(lang, "sent_room"), reply_markup=kb_client(lang))
+
+    @dp.message(SpaRequestFlow.waiting_date)
+    async def spa_req_date(m: Message, state: FSMContext):
+        lang = await get_lang(m.from_user.id) or "ru"
         ddmm = (m.text or "").strip()
         try:
             d, mo = parse_ddmm(ddmm)
         except Exception:
-            await m.answer("❌ Неверная дата. Пример: 20.02")
+            await m.answer(t(lang, "bad_date"))
             return
 
         n = now_tz()
         day = datetime(n.year, mo, d, 0, 0, tzinfo=TZ)
         if day.date() < n.date():
-            await m.answer("⚠️ Прошедшую дату нельзя. Введите снова:")
+            await m.answer(t(lang, "past_date"))
             return
 
         await state.update_data(ddmm=ddmm)
-        await state.set_state(SpaAddBookingFlow.waiting_time)
-        await m.answer("Введите время ЧЧ:ММ (например 14:00):")
+        await state.set_state(SpaRequestFlow.waiting_time)
+        await m.answer(t(lang, "spa_time"))
 
-    @dp.message(SpaAddBookingFlow.waiting_time)
-    async def spa_add_time(m: Message, state: FSMContext):
-        role = await get_role(m.from_user.id)
-        if role != ROLE_SPA:
-            await state.clear()
-            return await show_menu(m)
-
+    @dp.message(SpaRequestFlow.waiting_time)
+    async def spa_req_time(m: Message, state: FSMContext):
+        lang = await get_lang(m.from_user.id) or "ru"
         hhmm = (m.text or "").strip()
         try:
             tm = parse_hhmm(hhmm)
         except Exception:
-            await m.answer("❌ Неверное время. Пример: 14:00")
+            await m.answer(t(lang, "bad_time"))
             return
 
         if not in_working_hours(tm):
-            await m.answer("⚠️ Рабочие часы 09:00–22:00. Введите время снова:")
+            await m.answer(t(lang, "work_hours"))
             return
 
         data = await state.get_data()
         dt = make_dt_current_year(data["ddmm"], hhmm)
         if dt <= now_tz():
-            await m.answer("⚠️ Прошедшее время нельзя. Введите время снова:")
+            await m.answer(t(lang, "work_hours"))
             return
 
         await state.update_data(hhmm=hhmm)
-        await state.set_state(SpaAddBookingFlow.waiting_text)
-        await m.answer("Введите текст брони (например: Массаж; Имя; Комната 120):")
+        await state.set_state(SpaRequestFlow.waiting_text)
+        await m.answer(t(lang, "spa_text"))
 
-    @dp.message(SpaAddBookingFlow.waiting_text)
-    async def spa_add_text(m: Message, state: FSMContext):
-        role = await get_role(m.from_user.id)
-        if role != ROLE_SPA:
-            await state.clear()
-            return await show_menu(m)
-
+    @dp.message(SpaRequestFlow.waiting_text)
+    async def spa_req_text(m: Message, state: FSMContext):
+        lang = await get_lang(m.from_user.id) or "ru"
         text = (m.text or "").strip()
         if not text:
-            await m.answer("❌ Текст пустой. Введите снова:")
+            await m.answer(t(lang, "empty"))
             return
 
         data = await state.get_data()
         dt = make_dt_current_year(data["ddmm"], data["hhmm"])
-        if dt <= now_tz():
-            await state.clear()
-            await m.answer("⚠️ Прошедшее время нельзя. Начните заново.")
-            return
+        rid = await add_client_request(m.from_user.id, "spa", dt.strftime("%d.%m %H:%M"), text)
 
-        bid = await add_booking(dt, text, m.from_user.id)
+        # forward to SPA admins
+        admins = await list_admins(ROLE_SPA)
+        fwd = f"🧖 SPA REQUEST #{rid}\nWhen: {dt.strftime('%d.%m %H:%M')}\nFrom: {m.from_user.id}\nText: {text}\nPhone: {PHONE_SPA}"
+        for uid in admins:
+            try:
+                await m.bot.send_message(uid, fwd)
+            except Exception:
+                pass
+
         await state.clear()
-        await m.answer(f"✅ Бронь добавлена: #{bid} — {fmt_dt(dt)} — {text}", reply_markup=kb_spa())
+        await m.answer(t(lang, "sent_spa"), reply_markup=kb_client(lang))
 
-    @dp.message(F.text == "📅 Сегодня")
-    async def spa_today(m: Message):
-        role = await get_role(m.from_user.id)
-        if role != ROLE_SPA:
-            return await show_menu(m)
-        today = now_tz()
-        start, end = day_range(today)
-        rows = await list_bookings_between(start, end)
-        if not rows:
-            await m.answer("Сегодня броней нет ✅", reply_markup=kb_spa())
-            return
-        lines = ["📅 Брони на сегодня:"]
-        for bid, ts, txt in rows:
-            dt = datetime.fromisoformat(ts)
-            lines.append(f"#{bid} — {dt.strftime('%H:%M')} — {txt}")
-        await m.answer("\n".join(lines), reply_markup=kb_spa())
-
-    @dp.message(F.text == "📆 Брони на дату")
-    async def spa_on_date_btn(m: Message, state: FSMContext):
-        role = await get_role(m.from_user.id)
-        if role != ROLE_SPA:
-            return await show_menu(m)
-        await state.clear()
-        await state.set_state(SpaOnDateFlow.waiting_date)
-        await m.answer("Введите дату ДД.ММ (например 20.02):")
-
-    @dp.message(SpaOnDateFlow.waiting_date)
-    async def spa_on_date(m: Message, state: FSMContext):
-        role = await get_role(m.from_user.id)
-        if role != ROLE_SPA:
-            await state.clear()
-            return await show_menu(m)
-
-        ddmm = (m.text or "").strip()
-        try:
-            d, mo = parse_ddmm(ddmm)
-        except Exception:
-            await m.answer("❌ Неверная дата. Пример: 20.02")
-            return
-
-        n = now_tz()
-        day = datetime(n.year, mo, d, 0, 0, tzinfo=TZ)
-        start, end = day_range(day)
-        rows = await list_bookings_between(start, end)
-        await state.clear()
-
-        if not rows:
-            await m.answer(f"На {ddmm} броней нет ✅", reply_markup=kb_spa())
-            return
-
-        lines = [f"📆 Брони на {ddmm}:"]
-        for bid, ts, txt in rows:
-            dt = datetime.fromisoformat(ts)
-            lines.append(f"#{bid} — {dt.strftime('%H:%M')} — {txt}")
-        await m.answer("\n".join(lines), reply_markup=kb_spa())
-
-    @dp.message(F.text == "🗑 Удалить бронь")
-    async def spa_delete_btn(m: Message, state: FSMContext):
-        role = await get_role(m.from_user.id)
-        if role != ROLE_SPA:
-            return await show_menu(m)
-        await state.clear()
-        await state.set_state(SpaDeleteBookingFlow.waiting_id)
-        await m.answer("Введите ID брони (например 12):")
-
-    @dp.message(SpaDeleteBookingFlow.waiting_id)
-    async def spa_delete_id(m: Message, state: FSMContext):
-        role = await get_role(m.from_user.id)
-        if role != ROLE_SPA:
-            await state.clear()
-            return await show_menu(m)
-
+    # ---------------- ADMIN ROUTES ----------------
+    async def reception_routes(m: Message, state: FSMContext):
         txt = (m.text or "").strip()
-        if not txt.isdigit():
-            await m.answer("❌ Нужно число. Например 12:")
-            return
-        ok = await delete_booking(int(txt))
-        await state.clear()
-        await m.answer("✅ Удалено" if ok else "⚠️ Не найдено", reply_markup=kb_spa())
 
-    @dp.message()
-    async def fallback(m: Message):
-        await show_menu(m)
+        if txt == "➕ Счёт: Ресторан":
+            await state.clear()
+            await state.set_state(FolioAddFlow.waiting_room)
+            await state.update_data(category=CAT_RESTAURANT, created_by_role=ROLE_RECEPTION)
+            await m.answer(TXT["ru"]["need_room"])
+            return
+
+        if txt == "➕ Счёт: Прачка":
+            await state.clear()
+            await state.set_state(FolioAddFlow.waiting_room)
+            await state.update_data(category=CAT_LAUNDRY, created_by_role=ROLE_RECEPTION)
+            await m.answer(TXT["ru"]["need_room"])
+            return
+
+        if txt == "➕ Счёт: SPA (фолио)":
+            await state.clear()
+            await state.set_state(FolioAddFlow.waiting_room)
+            await state.update_data(category=CAT_SPA, created_by_role=ROLE_RECEPTION)
+            await m.answer(TXT["ru"]["need_room"])
+            return
+
+        if txt == "📄 Фолио по номеру":
+            await state.clear()
+            await state.set_state(FolioViewFlow.waiting_room)
+            await m.answer(TXT["ru"]["folio_enter_room"])
+            return
+
+        # Folio add flow
+        if await state.get_state() == FolioAddFlow.waiting_room.state:
+            try:
+                room = parse_room(m.text)
+            except Exception:
+                await m.answer(TXT["ru"]["bad_room"])
+                return
+            await state.update_data(room=room)
+            await state.set_state(FolioAddFlow.waiting_amount)
+            await m.answer(TXT["ru"]["need_amount"])
+            return
+
+        if await state.get_state() == FolioAddFlow.waiting_amount.state:
+            try:
+                amount = parse_amount(m.text)
+            except Exception:
+                await m.answer(TXT["ru"]["bad_amount"])
+                return
+            await state.update_data(amount=amount)
+            await state.set_state(FolioAddFlow.waiting_note)
+            await m.answer(TXT["ru"]["need_note"])
+            return
+
+        if await state.get_state() == FolioAddFlow.waiting_note.state:
+            data = await state.get_data()
+            category = data["category"]
+            room = data["room"]
+            amount = int(data["amount"])
+            note = (m.text or "").strip()
+            if note == "-" or note == "":
+                note = None
+            fid = await folio_add(room, category, amount, note, ROLE_RECEPTION, m.from_user.id)
+            total = await folio_total_by_room(room)
+            await state.clear()
+            await m.answer(f"✅ Добавлено (#{fid})\nКомната: {room}\nКатегория: {category}\nСумма: {amount}\nИтого по комнате: {total}", reply_markup=kb_reception())
+            return
+
+        # Folio view
+        if await state.get_state() == FolioViewFlow.waiting_room.state:
+            try:
+                room = parse_room(m.text)
+            except Exception:
+                await m.answer(TXT["ru"]["bad_room"])
+                return
+            rows = await folio_list_by_room(room)
+            total = await folio_total_by_room(room)
+            await state.clear()
+            if not rows:
+                await m.answer(f"Комната {room}: {TXT['ru']['folio_empty']}\nИтого: {total}", reply_markup=kb_reception())
+                return
+            lines = [f"📄 Фолио комнаты {room} (итого: {total})"]
+            for fid, cat, amt, note, by_role, created_at in rows:
+                dt = datetime.fromisoformat(created_at).astimezone(TZ)
+                extra = f" — {note}" if note else ""
+                lines.append(f"#{fid} | {cat} | {amt} | {dt.strftime('%d.%m %H:%M')} ({by_role}){extra}")
+            await m.answer("\n".join(lines), reply_markup=kb_reception())
+            return
+
+        # default
+        await m.answer(TXT["ru"]["admin_panel_reception"], reply_markup=kb_reception())
+
+    async def spa_routes(m: Message, state: FSMContext):
+        txt = (m.text or "").strip()
+
+        if txt == "➕ Добавить бронь":
+            await state.clear()
+            await state.set_state(SpaAddBookingFlow.waiting_date)
+            await m.answer(TXT["ru"]["ask_ddmm"])
+            return
+
+        if txt == "📅 Сегодня":
+            today = now_tz()
+            start, end = day_range(today)
+            rows = await list_bookings_between(start, end)
+            if not rows:
+                await m.answer(TXT["ru"]["today_none"], reply_markup=kb_spa())
+                return
+            lines = ["📅 Брони на сегодня:"]
+            for bid, ts, text2 in rows:
+                dt = datetime.fromisoformat(ts)
+                lines.append(f"#{bid} — {dt.strftime('%H:%M')} — {text2}")
+            await m.answer("\n".join(lines), reply_markup=kb_spa())
+            return
+
+        if txt == "📆 Брони на дату":
+            await state.clear()
+            await state.set_state(SpaOnDateFlow.waiting_date)
+            await m.answer(TXT["ru"]["ask_ddmm"])
+            return
+
+        if txt == "🗑 Удалить бронь":
+            await state.clear()
+            await state.set_state(SpaDeleteBookingFlow.waiting_id)
+            await m.answer(TXT["ru"]["ask_delete_id"])
+            return
+
+        if txt == "➕ Счёт: SPA (фолио)":
+            await state.clear()
+            await state.set_state(FolioAddFlow.waiting_room)
+            await state.update_data(category=CAT_SPA, created_by_role=ROLE_SPA)
+            await m.answer(TXT["ru"]["need_room"])
+            return
+
+        if txt == "📄 Фолио по номеру":
+            await state.clear()
+            await state.set_state(FolioViewFlow.waiting_room)
+            await m.answer(TXT["ru"]["folio_enter_room"])
+            return
+
+        # Spa add booking flow
+        if await state.get_state() == SpaAddBookingFlow.waiting_date.state:
+            ddmm = (m.text or "").strip()
+            try:
+                d, mo = parse_ddmm(ddmm)
+            except Exception:
+                await m.answer(TXT["ru"]["bad_date"])
+                return
+            n = now_tz()
+            day = datetime(n.year, mo, d, 0, 0, tzinfo=TZ)
+            if day.date() < n.date():
+                await m.answer(TXT["ru"]["past_date"])
+                return
+            await state.update_data(ddmm=ddmm)
+            await state.set_state(SpaAddBookingFlow.waiting_time)
+            await m.answer("Введите время ЧЧ:ММ (например 14:00):")
+            return
+
+        if await state.get_state() == SpaAddBookingFlow.waiting_time.state:
+            hhmm = (m.text or "").strip()
+            try:
+                tm = parse_hhmm(hhmm)
+            except Exception:
+                await m.answer(TXT["ru"]["bad_time"])
+                return
+            if not in_working_hours(tm):
+                await m.answer(TXT["ru"]["work_hours"])
+                return
+            data = await state.get_data()
+            dt = make_dt_current_year(data["ddmm"], hhmm)
+            if dt <= now_tz():
+                await m.answer(TXT["ru"]["work_hours"])
+                return
+            await state.update_data(hhmm=hhmm)
+            await state.set_state(SpaAddBookingFlow.waiting_text)
+            await m.answer("Введите текст брони (пример: Массаж; Имя; Телефон):")
+            return
+
+        if await state.get_state() == SpaAddBookingFlow.waiting_text.state:
+            text2 = (m.text or "").strip()
+            if not text2:
+                await m.answer(TXT["ru"]["empty"])
+                return
+            data = await state.get_data()
+            dt = make_dt_current_year(data["ddmm"], data["hhmm"])
+            bid = await add_booking(dt, text2, m.from_user.id)
+            await state.clear()
+            await m.answer(f"{TXT['ru']['added_booking']} #{bid} — {dt.strftime('%d.%m %H:%M')} — {text2}", reply_markup=kb_spa())
+            return
+
+        # Spa on date flow
+        if await state.get_state() == SpaOnDateFlow.waiting_date.state:
+            ddmm = (m.text or "").strip()
+            try:
+                d, mo = parse_ddmm(ddmm)
+            except Exception:
+                await m.answer(TXT["ru"]["bad_date"])
+                return
+            n = now_tz()
+            day = datetime(n.year, mo, d, 0, 0, tzinfo=TZ)
+            start, end = day_range(day)
+            rows = await list_bookings_between(start, end)
+            await state.clear()
+            if not rows:
+                await m.answer(TXT["ru"]["on_date_none"], reply_markup=kb_spa())
+                return
+            lines = [f"📆 Брони на {ddmm}:"]
+            for bid, ts, text2 in rows:
+                dt = datetime.fromisoformat(ts)
+                lines.append(f"#{bid} — {dt.strftime('%H:%M')} — {text2}")
+            await m.answer("\n".join(lines), reply_markup=kb_spa())
+            return
+
+        # Spa delete flow
+        if await state.get_state() == SpaDeleteBookingFlow.waiting_id.state:
+            s = (m.text or "").strip()
+            if not s.isdigit():
+                await m.answer(TXT["ru"]["only_number"])
+                return
+            ok = await delete_booking(int(s))
+            await state.clear()
+            await m.answer(TXT["ru"]["deleted"] if ok else TXT["ru"]["not_found"], reply_markup=kb_spa())
+            return
+
+        # Folio add/view flows (same as reception but role=SPA)
+        if await state.get_state() == FolioAddFlow.waiting_room.state:
+            try:
+                room = parse_room(m.text)
+            except Exception:
+                await m.answer(TXT["ru"]["bad_room"])
+                return
+            await state.update_data(room=room)
+            await state.set_state(FolioAddFlow.waiting_amount)
+            await m.answer(TXT["ru"]["need_amount"])
+            return
+
+        if await state.get_state() == FolioAddFlow.waiting_amount.state:
+            try:
+                amount = parse_amount(m.text)
+            except Exception:
+                await m.answer(TXT["ru"]["bad_amount"])
+                return
+            await state.update_data(amount=amount)
+            await state.set_state(FolioAddFlow.waiting_note)
+            await m.answer(TXT["ru"]["need_note"])
+            return
+
+        if await state.get_state() == FolioAddFlow.waiting_note.state:
+            data = await state.get_data()
+            category = data["category"]
+            room = data["room"]
+            amount = int(data["amount"])
+            note = (m.text or "").strip()
+            if note == "-" or note == "":
+                note = None
+            fid = await folio_add(room, category, amount, note, ROLE_SPA, m.from_user.id)
+            total = await folio_total_by_room(room)
+            await state.clear()
+            await m.answer(f"✅ Добавлено (#{fid})\nКомната: {room}\nКатегория: {category}\nСумма: {amount}\nИтого по комнате: {total}", reply_markup=kb_spa())
+            return
+
+        if await state.get_state() == FolioViewFlow.waiting_room.state:
+            try:
+                room = parse_room(m.text)
+            except Exception:
+                await m.answer(TXT["ru"]["bad_room"])
+                return
+            rows = await folio_list_by_room(room)
+            total = await folio_total_by_room(room)
+            await state.clear()
+            if not rows:
+                await m.answer(f"Комната {room}: {TXT['ru']['folio_empty']}\nИтого: {total}", reply_markup=kb_spa())
+                return
+            lines = [f"📄 Фолио комнаты {room} (итого: {total})"]
+            for fid, cat, amt, note, by_role, created_at in rows:
+                dt = datetime.fromisoformat(created_at).astimezone(TZ)
+                extra = f" — {note}" if note else ""
+                lines.append(f"#{fid} | {cat} | {amt} | {dt.strftime('%d.%m %H:%M')} ({by_role}){extra}")
+            await m.answer("\n".join(lines), reply_markup=kb_spa())
+            return
+
+        # default
+        await m.answer(TXT["ru"]["admin_panel_spa"], reply_markup=kb_spa())
 
     await dp.start_polling(bot)
 
+async def main():
+    await asyncio.gather(run_web_server(), run_bot())
+
 if __name__ == "__main__":
+    if not BOT_TOKEN:
+        raise RuntimeError("BOT_TOKEN пустой.")
     asyncio.run(main())
